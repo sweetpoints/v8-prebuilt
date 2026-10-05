@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from release_package import TARGETS, package
+from release_package import TARGETS, package, verify_library_grouping
 from sdk_smoke import PROBE
 from release_publish import publish
 
@@ -52,6 +52,11 @@ class ReleaseTests(unittest.TestCase):
             binary = root / target / 'lib' / ('v8_monolith.lib' if target.startswith('windows-') else 'libv8_monolith.a')
             binary.parent.mkdir()
             binary.write_bytes(b'!<arch>\n' + target.encode())
+            sdk_libraries = [binary.relative_to(root / target).as_posix()]
+            if target.startswith(('linux-', 'android-')):
+                runtime = binary.parent / 'libv8_rust_runtime.a'
+                runtime.write_bytes(b'!<arch>\nruntime')
+                sdk_libraries.append(runtime.relative_to(root / target).as_posix())
             license = root / 'licenses' / 'LICENSE'
             license.parent.mkdir()
             license.write_text('official license')
@@ -62,7 +67,10 @@ class ReleaseTests(unittest.TestCase):
                                'jit': False if target.startswith('ios-') else 'upstream-default',
                                'webAssembly': False if target.startswith('ios-') else 'upstream-default',
                                'experimentalRuntimeFlags': []}
-            linking_path.write_text(json.dumps({'schemaVersion': 1, 'libraries': [binary.relative_to(root / target).as_posix()], 'defines': [], 'compileOptions': [], 'linkOptions': [], 'systemLibraries': [], 'featureProfile': feature_profile}))
+            linking = {'schemaVersion': 1, 'libraries': sdk_libraries, 'defines': [], 'compileOptions': [], 'linkOptions': [], 'systemLibraries': [], 'featureProfile': feature_profile}
+            if target.startswith(('linux-', 'android-')):
+                linking['staticLibraryGrouping'] = 'rescan'
+            linking_path.write_text(json.dumps(linking))
             args = 'v8_enable_i18n_support = true\nv8_enable_temporal_support = true\nicu_use_data_file = false\n'
             if target.startswith('ios-'):
                 args += 'v8_jitless = true\nv8_enable_webassembly = false\n'
@@ -72,8 +80,10 @@ class ReleaseTests(unittest.TestCase):
                 probe.parent.mkdir(); probe.write_bytes(b'compiled-official-api-consumer')
                 sysroot = ('/official/debian_bullseye_' + ('arm64' if target == 'linux-arm64' else 'amd64') + '-sysroot') if target.startswith('linux-') else None
                 command = ['official-compiler', 'consumer.cpp'] + (['--sysroot=' + sysroot] if sysroot else [])
+                libraries = [str(root / target / name) for name in sdk_libraries]
+                command += ['-Wl,--start-group', *libraries, '-Wl,--end-group'] if target.startswith('linux-') else libraries
                 os_name = {'macos': 'Darwin', 'linux': 'Linux', 'windows': 'Windows'}[target.split('-')[0]]
-                (root / target / 'sdk-smoke.json').write_text(json.dumps({'schemaVersion': 1, 'status': 'passed', 'version': self.pins['v8']['version'], 'librarySha256': manifest['targets'][target]['sha256'], 'linkingSha256': hashlib.sha256(linking_path.read_bytes()).hexdigest(), 'libraries': {binary.relative_to(root / target).as_posix(): hashlib.sha256(binary.read_bytes()).hexdigest()}, 'probe': probe.relative_to(root / target).as_posix(), 'probeSha256': hashlib.sha256(probe.read_bytes()).hexdigest(), 'probeSourceSha256': hashlib.sha256(PROBE.encode()).hexdigest(), 'compiler': 'fixed official clang fixture', 'compileCommand': command, 'sysroot': sysroot, 'host': {'os': os_name, 'machine': 'arm64' if target.endswith('arm64') else 'x86_64'}, 'scope': 'official V8 API SDK consumer', 'nativeConsumerExecuted': True, 'cases': ['official_api_compile', 'official_api_link', 'official_api_execute']}))
+                (root / target / 'sdk-smoke.json').write_text(json.dumps({'schemaVersion': 1, 'status': 'passed', 'version': self.pins['v8']['version'], 'librarySha256': manifest['targets'][target]['sha256'], 'linkingSha256': hashlib.sha256(linking_path.read_bytes()).hexdigest(), 'libraries': {name: hashlib.sha256((root / target / name).read_bytes()).hexdigest() for name in sdk_libraries}, 'probe': probe.relative_to(root / target).as_posix(), 'probeSha256': hashlib.sha256(probe.read_bytes()).hexdigest(), 'probeSourceSha256': hashlib.sha256(PROBE.encode()).hexdigest(), 'compiler': 'fixed official clang fixture', 'compileCommand': command, 'sysroot': sysroot, 'host': {'os': os_name, 'machine': 'arm64' if target.endswith('arm64') else 'x86_64'}, 'scope': 'official V8 API SDK consumer', 'nativeConsumerExecuted': True, 'cases': ['official_api_compile', 'official_api_link', 'official_api_execute']}))
             if target == 'linux-arm64':
                 path = root / target / 'sdk-smoke.json'
                 report = json.loads(path.read_text())
@@ -87,7 +97,9 @@ class ReleaseTests(unittest.TestCase):
             entry['targetFiles'] = [{'path': p.relative_to(root).as_posix(), 'size': p.stat().st_size, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in (root / target).rglob('*') if p.is_file() and p.name != 'sdk-smoke.json']
             if target.startswith('android-'):
                 entry['validation']['linkTested'] = True
-                entry['linkSmoke'] = {'passed': True, 'runtimeExecuted': False, 'binaryInspection': {'elfMachine': 183 if target == 'android-arm64' else 62, 'loadSegmentAlignments': [16384]}}
+                entry['linkSmoke'] = {'passed': True, 'runtimeExecuted': False, 'binaryInspection': {'elfMachine': 183 if target == 'android-arm64' else 62, 'loadSegmentAlignments': [16384]},
+                                      'linkingSha256': hashlib.sha256(linking_path.read_bytes()).hexdigest(),
+                                      'command': ['fixed-compiler', '-shared', '-Wl,--start-group', *[str(root / target / name) for name in sdk_libraries], '-Wl,--end-group']}
             if target.startswith('ios-'):
                 platform = 2 if target == 'ios-arm64' else 7
                 entry['validation']['linkTested'] = True
@@ -179,6 +191,41 @@ class ReleaseTests(unittest.TestCase):
         self.reindex_file(target, path)
         with self.assertRaisesRegex(ValueError, 'GN feature configuration'):
             self.package()
+    def reject_link_command_change(self, change, message):
+        for target in ('android-arm64', 'linux-x64'):
+            with self.subTest(target=target):
+                path = self.inputs / target / ('manifest.json' if target.startswith('android-') else target + '/sdk-smoke.json')
+                original = path.read_text(); value = json.loads(original)
+                report = value['targets'][target]['linkSmoke'] if target.startswith('android-') else value
+                field = 'command' if target.startswith('android-') else 'compileCommand'
+                report[field] = change(report[field])
+                path.write_text(json.dumps(value))
+                try:
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.package()
+                finally:
+                    path.write_text(original)
+    def test_rescan_missing_group_rejected(self):
+        self.reject_link_command_change(lambda command: [v for v in command if v != '-Wl,--start-group'], 'rescan command evidence')
+    def test_rescan_library_order_rejected(self):
+        def reverse_libraries(command):
+            start = command.index('-Wl,--start-group'); end = command.index('-Wl,--end-group')
+            return command[:start + 1] + list(reversed(command[start + 1:end])) + command[end:]
+        self.reject_link_command_change(reverse_libraries, 'enclose all libraries in contract order')
+    def test_rescan_library_outside_group_rejected(self):
+        def move_library(command):
+            end = command.index('-Wl,--end-group')
+            return command[:end - 1] + [command[end], command[end - 1]] + command[end + 1:]
+        self.reject_link_command_change(move_library, 'enclose all libraries in contract order')
+    def test_rescan_duplicate_library_outside_group_rejected(self):
+        self.reject_link_command_change(lambda command: command + [command[command.index('-Wl,--start-group') + 1]], 'enclose all libraries in contract order')
+    def test_rescan_only_linux_and_android(self):
+        for target in ('macos-arm64', 'windows-x64', 'ios-arm64'):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ValueError, 'grouping policy'):
+                    verify_library_grouping(target, {'staticLibraryGrouping': 'rescan'}, [])
+                with self.assertRaisesRegex(ValueError, 'unsupported for target'):
+                    verify_library_grouping(target, {}, ['-Wl,--start-group', '-Wl,--end-group'])
     def test_header_tamper_rejected_by_inventory(self):
         (self.inputs / TARGETS[0] / TARGETS[0] / 'include' / 'v8.h').write_text('modified')
         with self.assertRaisesRegex(ValueError, 'hash or size'):

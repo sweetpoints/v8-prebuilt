@@ -51,6 +51,31 @@ def verify_feature_profile(root, target):
         if assignments != ['true' if value else 'false']:
             raise ValueError('full SDK GN feature configuration required')
 
+def verify_library_grouping(target, linking, command):
+    grouping = linking.get('staticLibraryGrouping', 'normal')
+    rescan_target = target.startswith(('linux-', 'android-'))
+    if grouping != ('rescan' if rescan_target else 'normal'):
+        raise ValueError('SDK static library grouping policy differs from target')
+    if not rescan_target:
+        if isinstance(command, list) and any(value in command for value in ('-Wl,--start-group', '-Wl,--end-group')):
+            raise ValueError('SDK archive rescan is unsupported for target')
+        return
+    libraries = linking.get('libraries')
+    if (not isinstance(command, list) or any(not isinstance(value, str) for value in command)
+            or not isinstance(libraries, list) or not libraries
+            or any(not isinstance(value, str) for value in libraries)
+            or len(set(libraries)) != len(libraries)
+            or command.count('-Wl,--start-group') != 1 or command.count('-Wl,--end-group') != 1):
+        raise ValueError('SDK archive rescan command evidence required')
+    start, end = command.index('-Wl,--start-group'), command.index('-Wl,--end-group')
+    grouped = command[start + 1:end] if start < end else []
+    matches = lambda argument, library: argument == library or argument.endswith('/' + library)
+    if (len(grouped) != len(libraries)
+            or any(not matches(argument, library) for argument, library in zip(grouped, libraries))
+            or any(matches(argument, library) for argument in command[:start] + command[end + 1:]
+                   for library in libraries)):
+        raise ValueError('SDK archive rescan must enclose all libraries in contract order')
+
 def archive(path, entries):
     with path.open('xb') as raw:
         with gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=0) as gz:
@@ -154,6 +179,13 @@ def package(inputs, pins_path, output, builder_revision):
             for item in entry.get('platformBuildInputs', []):
                 verify(manifest_path.parent, item)
             verify_feature_profile(manifest_path.parent, target)
+            linking = json.loads(contained(manifest_path.parent, target + '/linking.json').read_text())
+            if target.startswith('android-'):
+                if entry['linkSmoke'].get('linkingSha256') != digest(contained(manifest_path.parent, target + '/linking.json')):
+                    raise ValueError('Android SDK link command contract evidence differs')
+                verify_library_grouping(target, linking, entry['linkSmoke'].get('command'))
+            elif target.startswith('ios-'):
+                verify_library_grouping(target, linking, None)
             if target.startswith(('macos-', 'linux-', 'windows-')):
                 report_path = contained(manifest_path.parent, target + '/sdk-smoke.json')
                 report = json.loads(report_path.read_text())
@@ -172,6 +204,7 @@ def package(inputs, pins_path, output, builder_revision):
                 command = report.get('compileCommand')
                 if not isinstance(command, list) or not command or any(not isinstance(value, str) for value in command):
                     raise ValueError('SDK consumer compile command missing')
+                verify_library_grouping(target, linking, command)
                 for field in ('defines', 'compileOptions', 'linkOptions', 'systemLibraries'):
                     if not isinstance(linking.get(field), list) or any(not isinstance(value, str) for value in linking[field]):
                         raise ValueError('invalid SDK linking options')
