@@ -251,7 +251,8 @@ class BootstrapReuseTests(unittest.TestCase):
         workspace = root / pins['v8']['revision'] / 'macos-arm64'
         source = workspace / 'v8'
         rust = source / 'third_party/rust'
-        for path in (depot, source, rust):
+        libcxx = source / 'third_party/libc++/src'
+        for path in (depot, source, rust, libcxx):
             (path / '.git').mkdir(parents=True)
         (source / 'DEPS').write_text('official fixed DEPS')
         (workspace / '.gclient').write_text('official client config')
@@ -266,12 +267,13 @@ class BootstrapReuseTests(unittest.TestCase):
                 return pins['depotTools']['repository'] if cwd == depot else state['origin']
             if arguments[:2] == ['git', 'rev-parse']:
                 return (pins['depotTools']['revision'] if cwd == depot else
-                        state['rustRevision'] if cwd == rust else pins['v8']['revision'])
+                        state['rustRevision'] if cwd == rust else 'c' * 40 if cwd == libcxx else pins['v8']['revision'])
             if arguments[:2] == ['git', 'diff']:
                 return state['rustDiff'] if cwd == rust else state['depotDiff'] if cwd == depot else state['sourceDiff']
             if 'revinfo' in arguments:
                 return ('v8: ' + pins['v8']['repository'] + '@' + pins['v8']['revision'] + '\n'
                         'v8/third_party/rust: https://official/rust.git@' + 'a' * 40 + '\n'
+                        'v8/third_party/libc++/src: https://official/libcxx.git@' + 'c' * 40 + '\n'
                         'v8/tools:tools/pkg/${{arch}}: https://cipd/+/package/' + state['cipd'] + '\n')
             return ''
         return pins, source, depot, workspace, state, calls, execute
@@ -285,6 +287,7 @@ class BootstrapReuseTests(unittest.TestCase):
                 self.assertEqual(sum('sync' in call for call in calls), 1)
                 marker = json.loads((workspace / 'bootstrap-state.json').read_text())
                 self.assertIn('v8/third_party/rust', marker['trackedDiffSha256'])
+                self.assertIn('v8/third_party/libc++/src', marker['trackedDiffSha256'])
                 calls.clear()
                 self.assertEqual(builder.bootstrap(root, 'macos-arm64', pins, reuse=True)[:2], (source, depot))
                 self.assertFalse(any('sync' in call or 'fetch' in call or 'checkout' in call for call in calls))

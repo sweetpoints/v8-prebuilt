@@ -138,7 +138,7 @@ def bootstrap_snapshot(source, depot, workspace, pins, env):
             # fixed inventory remains covered by dependencyInventorySha256.
             continue
         relative, _, revision = match.groups()
-        if not re.fullmatch(r'v8(?:/[A-Za-z0-9_.-]+)*', relative) or any(part in ('.', '..') for part in relative.split('/')):
+        if not re.fullmatch(r'v8(?:/[A-Za-z0-9_+.\-]+)*', relative) or any(part in ('.', '..') for part in relative.split('/')):
             raise ValueError('Invalid dependency inventory path')
         path = workspace / relative
         if not (path / '.git').exists():
