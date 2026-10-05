@@ -18,8 +18,6 @@ PROBE = r'''#include <cstdio>
 int main(int argc, char** argv) {
   if (argc < 2 || std::strcmp(v8::V8::GetVersion(), argv[1])) return 2;
   if (argc > 2 && argv[2][0]) v8::V8::SetFlagsFromString(argv[2]);
-  // Test the compiled Temporal API without changing the SDK's upstream defaults.
-  v8::V8::SetFlagsFromString("--harmony-temporal");
   if (!v8::V8::InitializeICUDefaultLocation(argv[0])) return 5;
   auto platform = v8::platform::NewDefaultPlatform();
   v8::V8::InitializePlatform(platform.get());
