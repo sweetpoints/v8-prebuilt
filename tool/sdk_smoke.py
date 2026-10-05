@@ -97,6 +97,9 @@ def inputs(root):
 
 def compile_probe(root, contract, compiler, output, source, sysroot=None):
     style = contract.get('compilerStyle', 'clang-cl' if os.name == 'nt' else 'clang++')
+    requirement = contract.get('sysrootRequirement', {})
+    if requirement.get('kind') in ('chromium-linux-sysroot', 'android-ndk') and sysroot is None:
+        raise ValueError('SDK requires an explicit matching target sysroot')
     include = [sdk_path(root, item) for item in contract['includeDirs']]
     libraries = [sdk_path(root, item) for item in contract['libraries']]
     if style == 'clang-cl':
