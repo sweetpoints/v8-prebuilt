@@ -122,12 +122,72 @@ def initialize_depot(depot, env):
     run(['bash', '-c', command, '--', depot], depot, env)
 
 
-def bootstrap(cache, target, pins):
+
+def bootstrap_snapshot(source, depot, workspace, pins, env):
+    for path, pin in ((source, pins['v8']), (depot, pins['depotTools'])):
+        origin = run(['git', 'remote', 'get-url', 'origin'], path, env, capture=True).strip()
+        revision = run(['git', 'rev-parse', 'HEAD'], path, env, capture=True).strip()
+        if origin != pin['repository'] or revision != pin['revision']:
+            raise ValueError('Bootstrapped source/depot_tools origin or revision differs from pins')
+    inventory = run([depot_command(depot, 'gclient'), 'revinfo', '--actual'], workspace, env, capture=True)
+    repositories = {'depotTools': depot}
+    for line in inventory.splitlines():
+        match = re.fullmatch(r'(v8[^:]*): (.+)@([a-f0-9]{40})', line)
+        if match is None:
+            # CIPD package labels use a different inventory syntax. Their full
+            # fixed inventory remains covered by dependencyInventorySha256.
+            continue
+        relative, _, revision = match.groups()
+        if not re.fullmatch(r'v8(?:/[A-Za-z0-9_.-]+)*', relative) or any(part in ('.', '..') for part in relative.split('/')):
+            raise ValueError('Invalid dependency inventory path')
+        path = workspace / relative
+        if not (path / '.git').exists():
+            raise ValueError('Missing Git dependency in bootstrap inventory: ' + relative)
+        actual = run(['git', 'rev-parse', 'HEAD'], path, env, capture=True).strip()
+        if actual != revision:
+            raise ValueError('Git dependency revision differs from actual inventory: ' + relative)
+        repositories[relative] = path
+    if 'v8' not in repositories:
+        raise ValueError('Bootstrap inventory must include the pinned V8 Git checkout')
+    tracked = {}
+    for name, path in sorted(repositories.items()):
+        # Capture the post-hook baseline, including intentional upstream hook
+        # changes. Never print its contents or reset the checkout.
+        diff = run(['git', 'diff', '--binary', 'HEAD', '--'], path, env, capture=True)
+        tracked[name] = hashlib.sha256(diff.encode('utf-8')).hexdigest()
+    return {'schemaVersion': 1, 'pins': pins, 'depsSha256': sha(source / 'DEPS'),
+            'gclientSha256': sha(workspace / '.gclient'),
+            'dependencyInventorySha256': hashlib.sha256(inventory.encode('utf-8')).hexdigest(),
+            'trackedDiffSha256': tracked}
+
+
+def bootstrap(cache, target, pins, reuse=False):
     require_host(target)
     cache.mkdir(parents=True, exist_ok=True)
     depot = cache / ('depot_tools' if target.startswith(('macos-', 'ios-'))
                      else 'depot_tools-windows' if target.startswith('windows-')
                      else 'depot_tools-linux-x86_64')
+    workspace_target = ('android-arm64' if target.startswith('android-') else
+                        'ios-arm64' if target.startswith('ios-') else
+                        'linux-x64' if target.startswith('linux-') else
+                        'windows-x64' if target.startswith('windows-') else target)
+    workspace = cache / pins['v8']['revision'] / workspace_target
+    source = workspace / 'v8'
+    marker = workspace / 'bootstrap-state.json'
+    env = dict(os.environ, PATH=str(depot) + os.pathsep + os.environ['PATH'], DEPOT_TOOLS_UPDATE='0')
+    if target.startswith(('linux-', 'windows-')):
+        env = platform_module('desktop').environment(target, env)
+    if reuse and marker.is_file():
+        recorded = json.loads(marker.read_text())
+        if not isinstance(recorded, dict) or type(recorded.get('schemaVersion')) is not int or recorded.get('schemaVersion') != 1 or recorded.get('pins') != pins:
+            raise ValueError('Bootstrap marker pins differ; use an explicitly bootstrapped clean cache')
+        actual = bootstrap_snapshot(source, depot, workspace, pins, env)
+        if recorded != actual:
+            raise ValueError('Bootstrapped source/dependency contents changed; refusing cache reuse')
+        return source, depot, env
+    # An interrupted explicit bootstrap must not leave a previous successful
+    # marker authorizing reuse without this run completing its hooks.
+    marker.unlink(missing_ok=True)
     if not depot.exists():
         run(['git', 'clone', '--depth', '1', pins['depotTools']['repository'], depot], cache)
     origin = run(['git', 'remote', 'get-url', 'origin'], depot, capture=True).strip()
@@ -135,20 +195,12 @@ def bootstrap(cache, target, pins):
         raise ValueError('Unexpected depot_tools origin')
     run(['git', 'fetch', '--depth', '1', 'origin', pins['depotTools']['revision']], depot)
     run(['git', 'checkout', '--detach', pins['depotTools']['revision']], depot)
-    env = dict(os.environ, PATH=str(depot) + os.pathsep + os.environ['PATH'], DEPOT_TOOLS_UPDATE='0')
-    if target.startswith(('linux-', 'windows-')):
-        env = platform_module('desktop').environment(target, env)
     if target.startswith('windows-'):
         platform_module('desktop').initialize_depot_windows(depot, env, run)
     else:
         initialize_depot(depot, env)
     # Android ABIs share the fixed Linux-host DEPS checkout but have independent
     # GN output directories, so x64 cannot replace ARM64 objects or binaries.
-    workspace_target = ('android-arm64' if target.startswith('android-') else
-                        'ios-arm64' if target.startswith('ios-') else
-                        'linux-x64' if target.startswith('linux-') else
-                        'windows-x64' if target.startswith('windows-') else target)
-    workspace = cache / pins['v8']['revision'] / workspace_target
     workspace.mkdir(parents=True, exist_ok=True)
     gclient = 'solutions = ' + repr([{'name': 'v8', 'url': pins['v8']['repository'] + '@' + pins['v8']['revision'], 'deps_file': 'DEPS', 'managed': False, 'custom_deps': {}, 'custom_vars': {}}]) + '\n'
     if target.startswith('android-'):
@@ -161,6 +213,10 @@ def bootstrap(cache, target, pins):
     actual = run(['git', 'rev-parse', 'HEAD'], source, capture=True).strip()
     if actual != pins['v8']['revision']:
         raise ValueError('V8 checkout revision mismatch')
+    state = bootstrap_snapshot(source, depot, workspace, pins, env)
+    temporary_marker = marker.with_name('bootstrap-state.json.publishing')
+    temporary_marker.write_text(json.dumps(state, indent=2) + '\n')
+    os.replace(temporary_marker, marker)
     return source, depot, env
 
 
@@ -555,7 +611,7 @@ def main():
         parser.error('--jobs must be positive')
     pins = read_pins(args.pins_file)
     cache = args.cache_root.resolve()
-    source, depot, env = bootstrap(cache, args.target, pins)
+    source, depot, env = bootstrap(cache, args.target, pins, reuse=args.action == 'build')
     if args.action == 'bootstrap':
         print(json.dumps({'source': str(source), 'revision': pins['v8']['revision']}))
         return

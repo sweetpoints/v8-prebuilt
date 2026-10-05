@@ -164,6 +164,7 @@ class BuildContractTests(unittest.TestCase):
                  patch.object(builder, 'build') as build:
                 builder.main()
                 self.assertEqual(bootstrap.call_args.args, ((root / 'cache').resolve(), 'macos-x64', pins))
+                self.assertEqual(bootstrap.call_args.kwargs, {'reuse': True})
                 self.assertEqual(build.call_args.kwargs, {'output_root': (root / 'artifacts').resolve()})
 
     def test_mac_profile_includes_vendor_assertion_header_and_actual_frameworks(self):
@@ -241,6 +242,103 @@ class BuildContractTests(unittest.TestCase):
             self.assertIn('bootstrap_python3', command)
             self.assertIn('cipd_bin_setup', command)
             self.assertNotIn('gsutil', command)
+
+
+class BootstrapReuseTests(unittest.TestCase):
+    def fixture(self, root):
+        pins = builder.read_pins()
+        depot = root / 'depot_tools'
+        workspace = root / pins['v8']['revision'] / 'macos-arm64'
+        source = workspace / 'v8'
+        rust = source / 'third_party/rust'
+        for path in (depot, source, rust):
+            (path / '.git').mkdir(parents=True)
+        (source / 'DEPS').write_text('official fixed DEPS')
+        (workspace / '.gclient').write_text('official client config')
+        state = {'rustDiff': 'intentional official hook change', 'rustRevision': 'a' * 40,
+                 'cipd': 'fixed-package', 'origin': pins['v8']['repository'],
+                 'sourceDiff': '', 'depotDiff': ''}
+        calls = []
+        def execute(arguments, cwd, env=None, capture=False):
+            calls.append([str(value) for value in arguments])
+            cwd = Path(cwd)
+            if arguments[:3] == ['git', 'remote', 'get-url']:
+                return pins['depotTools']['repository'] if cwd == depot else state['origin']
+            if arguments[:2] == ['git', 'rev-parse']:
+                return (pins['depotTools']['revision'] if cwd == depot else
+                        state['rustRevision'] if cwd == rust else pins['v8']['revision'])
+            if arguments[:2] == ['git', 'diff']:
+                return state['rustDiff'] if cwd == rust else state['depotDiff'] if cwd == depot else state['sourceDiff']
+            if 'revinfo' in arguments:
+                return ('v8: ' + pins['v8']['repository'] + '@' + pins['v8']['revision'] + '\n'
+                        'v8/third_party/rust: https://official/rust.git@' + 'a' * 40 + '\n'
+                        'v8/tools:tools/pkg/${{arch}}: https://cipd/+/package/' + state['cipd'] + '\n')
+            return ''
+        return pins, source, depot, workspace, state, calls, execute
+
+    def test_post_hook_baseline_is_reused_without_second_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pins, source, depot, workspace, state, calls, execute = self.fixture(root)
+            with patch.object(builder, 'require_host'), patch.object(builder, 'initialize_depot'), patch.object(builder, 'run', side_effect=execute):
+                builder.bootstrap(root, 'macos-arm64', pins, reuse=True)
+                self.assertEqual(sum('sync' in call for call in calls), 1)
+                marker = json.loads((workspace / 'bootstrap-state.json').read_text())
+                self.assertIn('v8/third_party/rust', marker['trackedDiffSha256'])
+                calls.clear()
+                self.assertEqual(builder.bootstrap(root, 'macos-arm64', pins, reuse=True)[:2], (source, depot))
+                self.assertFalse(any('sync' in call or 'fetch' in call or 'checkout' in call for call in calls))
+                state['rustDiff'] += ' user modification'
+                with self.assertRaisesRegex(ValueError, 'contents changed'):
+                    builder.bootstrap(root, 'macos-arm64', pins, reuse=True)
+                self.assertFalse(any('--force' in call or 'reset' in call for call in calls))
+
+    def test_source_deps_cipd_and_client_changes_reject_reuse(self):
+        for changed in ('DEPS', 'client', 'cipd', 'sourceDiff', 'depotDiff'):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                pins, source, depot, workspace, state, calls, execute = self.fixture(root)
+                with patch.object(builder, 'require_host'), patch.object(builder, 'initialize_depot'), patch.object(builder, 'run', side_effect=execute):
+                    builder.bootstrap(root, 'macos-arm64', pins)
+                    if changed == 'DEPS': (source / 'DEPS').write_text('changed DEPS')
+                    elif changed == 'client': (workspace / '.gclient').write_text('changed config')
+                    elif changed == 'cipd': state['cipd'] = 'changed-package'
+                    else: state[changed] = 'modified tracked file'
+                    calls.clear()
+                    with self.assertRaisesRegex(ValueError, 'contents changed'):
+                        builder.bootstrap(root, 'macos-arm64', pins, reuse=True)
+                    self.assertFalse(any('sync' in call for call in calls))
+
+    def test_revision_origin_and_missing_dependency_are_rejected(self):
+        for changed in ('revision', 'origin', 'missing'):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                pins, source, depot, workspace, state, calls, execute = self.fixture(root)
+                with patch.object(builder, 'run', side_effect=execute):
+                    if changed == 'revision': state['rustRevision'] = 'b' * 40
+                    elif changed == 'origin': state['origin'] = 'https://unexpected/source.git'
+                    else: (source / 'third_party/rust/.git').rmdir()
+                    with self.assertRaises(ValueError):
+                        builder.bootstrap_snapshot(source, depot, workspace, pins, {})
+
+    def test_marker_pins_and_shape_reject_before_any_checkout_actions(self):
+        for value in ([], {'schemaVersion': 1, 'pins': {}}, {'schemaVersion': True}):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                pins, source, depot, workspace, state, calls, execute = self.fixture(root)
+                (workspace / 'bootstrap-state.json').write_text(json.dumps(value))
+                with patch.object(builder, 'require_host'), patch.object(builder, 'run') as run:
+                    with self.assertRaises(ValueError): builder.bootstrap(root, 'macos-arm64', pins, reuse=True)
+                    run.assert_not_called()
+
+    def test_failed_explicit_bootstrap_invalidates_previous_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pins, source, depot, workspace, state, calls, execute = self.fixture(root)
+            marker = workspace / 'bootstrap-state.json'; marker.write_text('{}')
+            with patch.object(builder, 'require_host'), patch.object(builder, 'run', side_effect=OSError('bootstrap failure')):
+                with self.assertRaises(OSError): builder.bootstrap(root, 'macos-arm64', pins)
+            self.assertFalse(marker.exists())
 
 
 if __name__ == '__main__': unittest.main()
