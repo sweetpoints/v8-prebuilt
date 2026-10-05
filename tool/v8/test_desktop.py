@@ -129,12 +129,23 @@ class DesktopTest(unittest.TestCase):
                 config = out / 'gen/buildtools/third_party/libc++/__config_site'
                 config.parent.mkdir(parents=True, exist_ok=True)
                 config.write_text('matching-generated-config')
+                vendor = source / 'buildtools/third_party/libc++/__assertion_handler'
+                vendor.parent.mkdir(parents=True, exist_ok=True)
+                vendor.write_text('matching-vendor-assertions')
                 def run(args, *a, **kw):
                     self.assertIn('--root-target=//sdk_runtime:sdk', args)
+                    if args[4] == 'cflags_cc':
+                        flags = ['-std=c++20', '-fno-exceptions', '-isystem../../private/include']
+                        if target.startswith('linux'):
+                            flags.append('-fexperimental-relative-c++-abi-vtables')
+                        return json.dumps({args[3]: {'cflags_cc': flags}})
                     return json.dumps({args[3]: {'outputs': ['//' + paths[args[3]].relative_to(source).as_posix()]}})
                 result = desktop.sdk_profile(source, out, target, self.pins(), ['V8_COMPRESS_POINTERS'], run, 'gn', {})
                 self.assertEqual(2, len(result['libraries']))
                 self.assertEqual(config, result['runtimeHeaders']['include/c++/config/__config_site'])
+                self.assertEqual(vendor, result['runtimeHeaders']['include/c++/config/__assertion_handler'])
+                self.assertEqual(target.startswith('linux'), '-fexperimental-relative-c++-abi-vtables' in result['linking']['compileOptions'])
+                self.assertFalse(any('private/include' in flag for flag in result['linking']['compileOptions']))
                 self.assertEqual(['V8_COMPRESS_POINTERS'], result['linking']['defines'])
                 self.assertTrue(all(not Path(name).is_absolute() for name in result['linking']['libraries']))
                 self.assertEqual('clang-cl' if target.startswith('windows') else 'clang++', result['linking']['compilerStyle'])
@@ -143,6 +154,9 @@ class DesktopTest(unittest.TestCase):
                 self.assertIn('--target=' + ('x86_64-pc-windows-msvc' if target.startswith('windows') else 'aarch64-linux-gnu'), flags)
                 self.assertIn('/GR-' if target.startswith('windows') else '-fno-rtti', flags)
                 self.assertIn('/clang:-fno-exceptions' if target.startswith('windows') else '-fno-exceptions', flags)
+                vendor.unlink()
+                with self.assertRaisesRegex(ValueError, 'vendor headers missing'):
+                    desktop.sdk_profile(source, out, target, self.pins(), [], run, 'gn', {})
 
 
 if __name__ == '__main__':

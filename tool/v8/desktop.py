@@ -169,15 +169,33 @@ def inspect_archive(path, target):
     return {'format': 'static-archive', 'objectMachine': MACHINES[target], 'objectCount': objects}
 
 
-def _gn_archive(source, out, label, run, gn, env, target):
-    values = json.loads(run([gn, 'desc', out, label, 'outputs', '--format=json', '--root-target=//sdk_runtime:sdk'],
+def _gn_values(source, out, label, key, run, gn, env):
+    values = json.loads(run([gn, 'desc', out, label, key, '--format=json', '--root-target=//sdk_runtime:sdk'],
                             source, env, capture=True))
     if isinstance(values, dict):
         if set(values) != {label} or not isinstance(values[label], dict):
             raise ValueError('GN output target differs from requested label')
-        values = values[label].get('outputs')
-    if not isinstance(values, list):
-        raise ValueError('GN outputs must contain an array')
+        values = values[label].get(key)
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise ValueError('GN ' + key + ' must contain a string array')
+    return values
+
+
+def _consumer_abi_options(flags):
+    # Export ABI choices, never the build tree's absolute/relative include paths.
+    exact = {'-fno-rtti', '-frtti', '/GR-', '/GR', '-fno-exceptions', '-fexceptions',
+             '-fexperimental-relative-c++-abi-vtables', '-fno-experimental-relative-c++-abi-vtables',
+             '-fshort-wchar', '-fno-short-wchar', '-fshort-enums', '-fno-short-enums',
+             '-fsized-deallocation', '-fno-sized-deallocation'}
+    prefixes = ('-std=', '/std:', '/EH', '-fc++-abi=', '-fclang-abi-compat=',
+                '-fms-compatibility-version=', '-fpack-struct=')
+    return [flag for flag in flags
+            if (flag.removeprefix('/clang:') in exact or
+                flag.removeprefix('/clang:').startswith(prefixes))]
+
+
+def _gn_archive(source, out, label, run, gn, env, target):
+    values = _gn_values(source, out, label, 'outputs', run, gn, env)
     extension = '.lib' if target.startswith('windows-') else '.a'
     archives = []
     for value in values:
@@ -218,12 +236,21 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
                 if path.is_symlink():
                     raise ValueError('Runtime header symlinks are not SDK payloads')
                 headers[destination + '/' + path.relative_to(directory).as_posix()] = path
-    config = out / 'gen/buildtools/third_party/libc++/__config_site'
-    if not config.is_file():
-        config = source / 'buildtools/third_party/libc++/__config_site'
-    if not config.is_file():
-        raise ValueError('Matching Chromium libc++ config site missing')
-    headers['include/c++/config/__config_site'] = config
+    vendor = source / 'buildtools/third_party/libc++'
+    generated_vendor = out / 'gen/buildtools/third_party/libc++'
+    vendor_names = {path.name for directory in (vendor, generated_vendor) if directory.is_dir()
+                    for path in directory.iterdir() if path.is_file() and path.name.startswith('__')}
+    if not {'__config_site', '__assertion_handler'}.issubset(vendor_names):
+        raise ValueError('Matching Chromium libc++ vendor headers missing')
+    for name in sorted(vendor_names):
+        path = generated_vendor / name
+        if not path.is_file():
+            path = vendor / name
+        if path.is_symlink():
+            raise ValueError('Runtime vendor header symlinks are not SDK payloads')
+        headers['include/c++/config/' + name] = path
+    abi_options = _consumer_abi_options(
+        _gn_values(source, out, '//:v8_monolith', 'cflags_cc', run, gn, env))
     triple = ({'x64': 'x86_64', 'arm64': 'aarch64'}[cpu] +
               ('-pc-windows-msvc' if os_name == 'windows' else '-linux-gnu'))
     linking = {
@@ -240,6 +267,8 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
         'cxxRuntime': 'pinned Chromium libc++ (__Cr ABI)',
         'crt': 'static MSVC /MT' if os_name == 'windows' else 'system glibc',
     }
+    linking['abiCompileOptions'] = abi_options
+    linking['compileOptions'] = list(dict.fromkeys(linking['compileOptions'] + abi_options))
     if os_name == 'linux':
         linking['sysrootRequirement'] = {
             'kind': 'chromium-linux-sysroot', 'architecture': 'amd64' if cpu == 'x64' else 'arm64',
