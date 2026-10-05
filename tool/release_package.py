@@ -9,8 +9,6 @@ from pathlib import Path
 import re
 import tarfile
 
-EXPORTS = {'sv8_create', 'sv8_start', 'sv8_poll', 'sv8_resolve', 'sv8_sync_poll', 'sv8_sync_reply', 'sv8_cancel', 'sv8_destroy', 'sv8_free', 'sv8_version'}
-
 TARGETS = ('android-arm64', 'android-x64', 'ios-arm64', 'ios-simulator-arm64',
            'macos-arm64', 'macos-x64', 'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64')
 
@@ -55,13 +53,17 @@ def package(inputs, pins_path, output, builder_revision):
         m = json.loads(manifest_path.read_text())
         if m.get('schemaVersion') != 1 or m['v8'] != pins['v8'] or m['depotTools'] != pins['depotTools']:
             raise ValueError('manifest provenance differs from pins')
-        base = {key: m[key] for key in ('schemaVersion', 'v8', 'depotTools', 'bridge')}
+        if 'bridge' in m:
+            raise ValueError('pure SDK manifest must not contain a project bridge')
+        base = {key: m[key] for key in ('schemaVersion', 'v8', 'depotTools')}
         if provenance is not None and provenance != base:
             raise ValueError('target provenance differs')
         provenance = base
         for target, entry in m['targets'].items():
             if target not in TARGETS or target in found:
                 raise ValueError('unknown or duplicate target')
+            if entry.get('artifactKind') != 'v8-static-sdk':
+                raise ValueError('pure V8 static SDK artifact required')
             verify(manifest_path.parent, entry, 'binary')
             inventory = entry.get('targetFiles', entry.get('files'))
             if not isinstance(inventory, list) or not inventory:
@@ -73,26 +75,24 @@ def package(inputs, pins_path, output, builder_revision):
                 verify(manifest_path.parent, item)
                 indexed.add(item['path'])
             actual_files = {p.relative_to(manifest_path.parent).as_posix() for p in (manifest_path.parent / target).rglob('*') if p.is_file()}
-            if actual_files - indexed - {target + '/runtime-smoke.json'} or indexed - actual_files:
+            if actual_files - indexed - {target + '/sdk-smoke.json'} or indexed - actual_files:
                 raise ValueError('unindexed target artifact file')
             if not entry.get('validation', {}).get('built'):
                 raise ValueError('successful native build evidence required')
-            inspection = entry.get('binaryInspection', {})
             if target.startswith('android-'):
+                smoke = entry.get('linkSmoke', {})
+                inspection = smoke.get('binaryInspection', {})
                 alignments = inspection.get('loadSegmentAlignments', [])
-                if (inspection.get('elfMachine') != (183 if target == 'android-arm64' else 62)
+                if (not entry.get('validation', {}).get('linkTested') or smoke.get('passed') is not True
+                        or inspection.get('elfMachine') != (183 if target == 'android-arm64' else 62)
                         or not alignments or any(x < 16384 for x in alignments)
-                        or set(inspection.get('exports', [])) != EXPORTS):
-                    raise ValueError('Android ELF/export/16KiB build evidence required')
+                        or smoke.get('runtimeExecuted') is not False):
+                    raise ValueError('Android final consumer ELF/16KiB link evidence required')
             if target.startswith('ios-'):
                 smoke = entry.get('linkSmoke', {})
                 expected_platform = 2 if target == 'ios-arm64' else 7
                 if (not entry.get('validation', {}).get('linkTested') or smoke.get('passed') is not True
                         or smoke.get('runtimeExecuted') is not False
-                        or inspection.get('format') != 'static-ar' or inspection.get('architecture') != 'arm64'
-                        or inspection.get('platform') != expected_platform
-                        or inspection.get('objectCount', 0) < 1
-                        or set(inspection.get('bridgeExports', [])) != EXPORTS
                         or smoke.get('executableInspection', {}).get('platform') != expected_platform):
                     raise ValueError('iOS static SDK link/platform build evidence required')
             for filename, field in [('args.gn', 'gnArgsSha256'), ('dependencies.txt', 'dependencyInventorySha256'), ('defines.json', 'definesSha256')]:
@@ -103,7 +103,7 @@ def package(inputs, pins_path, output, builder_revision):
             for item in entry.get('platformBuildInputs', []):
                 verify(manifest_path.parent, item)
             if target.startswith(('macos-', 'linux-', 'windows-')):
-                report_path = contained(manifest_path.parent, target + '/runtime-smoke.json')
+                report_path = contained(manifest_path.parent, target + '/sdk-smoke.json')
                 report = json.loads(report_path.read_text())
                 os_name = {'macos': 'Darwin', 'linux': 'Linux', 'windows': 'Windows'}[target.split('-')[0]]
                 machine = report.get('host', {}).get('machine', '').lower()
@@ -112,7 +112,9 @@ def package(inputs, pins_path, output, builder_revision):
                         or report.get('version') != pins['v8']['version']
                         or report.get('librarySha256') != entry['sha256']
                         or report.get('host', {}).get('os') != os_name or machine not in expected_machines
-                        or set(report.get('cases', [])) != {'arithmetic', 'promise', 'unicode', 'exception', 'timeout', 'cancel_before_start'}):
+                        or report.get('scope') != 'official V8 API SDK consumer'
+                        or report.get('nativeConsumerExecuted') is not True
+                        or set(report.get('cases', [])) != {'official_api_compile', 'official_api_link', 'official_api_execute'}):
                     raise ValueError('native runtime smoke evidence differs')
                 entry = dict(entry, validation=dict(entry.get('validation', {}), runtimeTested=True, sourceCompatibilityTested=False))
             elif entry.get('validation', {}).get('runtimeTested'):
@@ -146,8 +148,10 @@ def package(inputs, pins_path, output, builder_revision):
         entry['targetFiles'] = entry['files']
         single = dict(provenance, targets={target: entry}, licenses=manifest['licenses'])
         entries['manifest.json'] = (json.dumps(single, indent=2, sort_keys=True) + '\n').encode()
-        if not any(name.endswith('source_v8.h') for name in entries):
-            raise ValueError('consumer bridge header required')
+        if target + '/include/v8.h' not in entries or target + '/linking.json' not in entries:
+            raise ValueError('consumer V8 headers and linking contract required')
+        if any(Path(name).name.startswith('source_v8.') for name in entries):
+            raise ValueError('project bridge is not a pure V8 SDK payload')
         name = f"v8-{pins['v8']['version']}-{target}.tar.gz"
         dest = output / name
         archive(dest, entries)

@@ -90,11 +90,10 @@ jobs:
           sudo "$source_root" --no-prompt
       - name: Build the native SDK
         run: python tool/v8/build.py build --target '${{ matrix.target }}' --pins-file stable-pins.json --cache-root "$V8_CACHE_ROOT" --output-root artifacts --jobs '${{ matrix.jobs }}'
-      - name: Execute native desktop C ABI cases
+      - name: Compile, link and execute an official V8 API SDK consumer
         if: startsWith(matrix.target, 'macos-') || matrix.target == 'linux-x64' || startsWith(matrix.target, 'windows-')
         run: |
-          library=$(python -c 'import json,pathlib; m=json.loads(pathlib.Path("artifacts/${{ needs.detect.outputs.revision }}/manifest.json").read_text()); print(pathlib.Path("artifacts/${{ needs.detect.outputs.revision }}")/m["targets"]["${{ matrix.target }}"]["binary"])')
-          python tool/smoke.py --library "$library" --expected-version '${{ needs.detect.outputs.version }}' --output 'artifacts/${{ needs.detect.outputs.revision }}/${{ matrix.target }}/runtime-smoke.json'
+          python tool/sdk_smoke.py --sdk-root 'artifacts/${{ needs.detect.outputs.revision }}/${{ matrix.target }}' --expected-version '${{ needs.detect.outputs.version }}' --output 'artifacts/${{ needs.detect.outputs.revision }}/${{ matrix.target }}/sdk-smoke.json'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: v8-${{ matrix.target }}
@@ -111,12 +110,12 @@ jobs:
         with:
           name: v8-linux-arm64
           path: artifacts/${{ needs.detect.outputs.revision }}
-      - name: Execute ARM64 native C ABI cases
-        run: python3 tool/smoke.py --library 'artifacts/${{ needs.detect.outputs.revision }}/linux-arm64/libsource_v8.so' --expected-version '${{ needs.detect.outputs.version }}' --output runtime-smoke.json
+      - name: Compile, link and execute an ARM64 official V8 API SDK consumer
+        run: python3 tool/sdk_smoke.py --sdk-root 'artifacts/${{ needs.detect.outputs.revision }}/linux-arm64' --expected-version '${{ needs.detect.outputs.version }}' --output sdk-smoke.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-arm-runtime
-          path: runtime-smoke.json
+          path: sdk-smoke.json
           if-no-files-found: error
   publish:
     needs: [detect, build, linux-arm-runtime]
@@ -139,7 +138,7 @@ jobs:
           path: arm-runtime
       - name: Assemble complete deterministic release
         run: |
-          cp arm-runtime/runtime-smoke.json inputs/v8-linux-arm64/linux-arm64/runtime-smoke.json
+          cp arm-runtime/sdk-smoke.json inputs/v8-linux-arm64/linux-arm64/sdk-smoke.json
           python3 -m unittest discover -s tests -p 'test_*.py'
           python3 -m unittest discover -s tool -p 'test_*.py'
           python3 -m unittest discover -s tool/v8 -p 'test_*.py'

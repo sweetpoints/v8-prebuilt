@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from release_package import EXPORTS, TARGETS, package
+from release_package import TARGETS, package
 from release_publish import publish
 
 class FakeGitHub:
@@ -47,26 +47,29 @@ class ReleaseTests(unittest.TestCase):
             root = self.inputs / target
             out = root / target / 'include'
             out.mkdir(parents=True)
-            (out / 'source_v8.h').write_text('header')
+            (out / 'v8.h').write_text('header')
             binary = root / target / 'library'
             binary.write_bytes(target.encode())
             license = root / 'licenses' / 'LICENSE'
             license.parent.mkdir()
             license.write_text('official license')
             manifest = {key: self.pins[key] for key in ('schemaVersion', 'v8', 'depotTools')}
-            manifest.update(bridge={'abi': 1, 'sourceSha256': 'c' * 64}, targets={target: {'binary': f'{target}/library', 'size': binary.stat().st_size, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}}, licenses=[{'path': 'licenses/LICENSE', 'sha256': hashlib.sha256(license.read_bytes()).hexdigest()}])
+            manifest.update(targets={target: {'binary': f'{target}/library', 'size': binary.stat().st_size, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}}, licenses=[{'path': 'licenses/LICENSE', 'sha256': hashlib.sha256(license.read_bytes()).hexdigest()}])
             if target.startswith(('macos-', 'linux-', 'windows-')):
                 os_name = {'macos': 'Darwin', 'linux': 'Linux', 'windows': 'Windows'}[target.split('-')[0]]
-                (root / target / 'runtime-smoke.json').write_text(json.dumps({'schemaVersion': 1, 'status': 'passed', 'version': self.pins['v8']['version'], 'librarySha256': manifest['targets'][target]['sha256'], 'host': {'os': os_name, 'machine': 'arm64' if target.endswith('arm64') else 'x86_64'}, 'cases': ['arithmetic', 'promise', 'unicode', 'exception', 'timeout', 'cancel_before_start']}))
+                (root / target / 'sdk-smoke.json').write_text(json.dumps({'schemaVersion': 1, 'status': 'passed', 'version': self.pins['v8']['version'], 'librarySha256': manifest['targets'][target]['sha256'], 'host': {'os': os_name, 'machine': 'arm64' if target.endswith('arm64') else 'x86_64'}, 'scope': 'official V8 API SDK consumer', 'nativeConsumerExecuted': True, 'cases': ['official_api_compile', 'official_api_link', 'official_api_execute']}))
             entry = manifest['targets'][target]
+            entry['artifactKind'] = 'v8-static-sdk'
             entry['validation'] = {'built': True, 'runtimeTested': False}
-            entry['targetFiles'] = [{'path': p.relative_to(root).as_posix(), 'size': p.stat().st_size, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in (root / target).rglob('*') if p.is_file() and p.name != 'runtime-smoke.json']
+            (root / target / 'linking.json').write_text('{}')
+            entry['targetFiles'] = [{'path': p.relative_to(root).as_posix(), 'size': p.stat().st_size, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in (root / target).rglob('*') if p.is_file() and p.name != 'sdk-smoke.json']
             if target.startswith('android-'):
-                entry['binaryInspection'] = {'elfMachine': 183 if target == 'android-arm64' else 62, 'loadSegmentAlignments': [16384], 'exports': sorted(EXPORTS)}
+                entry['validation']['linkTested'] = True
+                entry['linkSmoke'] = {'passed': True, 'runtimeExecuted': False, 'binaryInspection': {'elfMachine': 183 if target == 'android-arm64' else 62, 'loadSegmentAlignments': [16384]}}
             if target.startswith('ios-'):
                 platform = 2 if target == 'ios-arm64' else 7
                 entry['validation']['linkTested'] = True
-                entry['binaryInspection'] = {'format': 'static-ar', 'architecture': 'arm64', 'platform': platform, 'objectCount': 1, 'bridgeExports': sorted(EXPORTS)}
+                entry['binaryInspection'] = {'format': 'static-ar', 'architecture': 'arm64', 'platform': platform, 'objectCount': 1}
                 entry['linkSmoke'] = {'passed': True, 'runtimeExecuted': False, 'executableInspection': {'platform': platform}}
             (root / 'manifest.json').write_text(json.dumps(manifest))
     def package(self, name='dist'):
@@ -88,12 +91,12 @@ class ReleaseTests(unittest.TestCase):
             self.package()
     def test_mixed_provenance_rejected(self):
         path = self.inputs / TARGETS[0] / 'manifest.json'
-        m = json.loads(path.read_text()); m['bridge']['sourceSha256'] = 'e' * 64
+        m = json.loads(path.read_text()); m['depotTools']['revision'] = 'e' * 40
         path.write_text(json.dumps(m))
         with self.assertRaisesRegex(ValueError, 'provenance differs'):
             self.package()
     def test_header_required(self):
-        (self.inputs / TARGETS[0] / TARGETS[0] / 'include' / 'source_v8.h').unlink()
+        (self.inputs / TARGETS[0] / TARGETS[0] / 'include' / 'v8.h').unlink()
         with self.assertRaisesRegex(ValueError, 'missing or unsafe'):
             self.package()
     def change_manifest(self, target, change):
@@ -102,7 +105,7 @@ class ReleaseTests(unittest.TestCase):
         change(manifest['targets'][target])
         path.write_text(json.dumps(manifest))
     def test_header_tamper_rejected_by_inventory(self):
-        (self.inputs / TARGETS[0] / TARGETS[0] / 'include' / 'source_v8.h').write_text('modified')
+        (self.inputs / TARGETS[0] / TARGETS[0] / 'include' / 'v8.h').write_text('modified')
         with self.assertRaisesRegex(ValueError, 'hash or size'):
             self.package()
     def test_unindexed_payload_rejected(self):
@@ -111,18 +114,18 @@ class ReleaseTests(unittest.TestCase):
             self.package()
     def test_wrong_runtime_binary_rejected(self):
         target = 'linux-x64'
-        path = self.inputs / target / target / 'runtime-smoke.json'
+        path = self.inputs / target / target / 'sdk-smoke.json'
         report = json.loads(path.read_text()); report['librarySha256'] = '0' * 64
         path.write_text(json.dumps(report))
         with self.assertRaisesRegex(ValueError, 'runtime smoke'):
             self.package()
     def test_missing_runtime_report_rejected(self):
         target = 'linux-arm64'
-        (self.inputs / target / target / 'runtime-smoke.json').unlink()
+        (self.inputs / target / target / 'sdk-smoke.json').unlink()
         with self.assertRaisesRegex(ValueError, 'missing or unsafe'):
             self.package()
     def test_android_bad_alignment_rejected(self):
-        self.change_manifest('android-x64', lambda e: e['binaryInspection'].update(loadSegmentAlignments=[4096]))
+        self.change_manifest('android-x64', lambda e: e['linkSmoke']['binaryInspection'].update(loadSegmentAlignments=[4096]))
         with self.assertRaisesRegex(ValueError, '16KiB'):
             self.package()
     def test_ios_device_simulator_mismatch_rejected(self):
@@ -147,6 +150,21 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'identity'):
             publish(self.root / 'dist', 'example/test', '', gh)
         self.assertEqual([], gh.mutations)
+    def test_project_bridge_manifest_rejected(self):
+        path = self.inputs / TARGETS[0] / 'manifest.json'
+        manifest = json.loads(path.read_text()); manifest['bridge'] = {'abi': 1}
+        path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'project bridge'):
+            self.package()
+    def test_wrong_artifact_kind_rejected(self):
+        self.change_manifest('linux-x64', lambda e: e.update(artifactKind='shared-bridge'))
+        with self.assertRaisesRegex(ValueError, 'pure V8 static SDK'):
+            self.package()
+    def test_missing_v8_link_contract_rejected(self):
+        target = 'android-arm64'
+        (self.inputs / target / target / 'linking.json').unlink()
+        with self.assertRaisesRegex(ValueError, 'missing or unsafe'):
+            self.package()
     def test_publish_idempotent_no_overwrite(self):
         self.package(); gh = FakeGitHub()
         self.assertEqual('v8-15.4.80.24', publish(self.root / 'dist', 'example/test', '', gh))

@@ -82,7 +82,11 @@ def publish(directory, repository, token, github=None):
         raise ValueError('complete expected release assets required')
     if not re.fullmatch(r'[0-9a-f]{40}', manifest['builderRevision']):
         raise ValueError('fixed builder revision required')
+    if 'bridge' in manifest:
+        raise ValueError('pure SDK release must not contain a project bridge')
     for target, entry in manifest['targets'].items():
+        if entry.get('artifactKind') != 'v8-static-sdk':
+            raise ValueError('pure V8 static SDK artifact required')
         validation = entry.get('validation', {})
         if not validation.get('built') or validation.get('sourceCompatibilityTested'):
             raise ValueError('invalid release build verification scope')
