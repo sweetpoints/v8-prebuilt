@@ -1,0 +1,4 @@
+{
+  global: sv8_*;
+  local: *;
+};
