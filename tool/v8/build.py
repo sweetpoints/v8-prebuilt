@@ -723,6 +723,16 @@ def apple_android_profile(source, out, target, pins, defines, depot, env):
         if '--unwindlib=none' not in official_ldflags:
             raise ValueError('Pinned Android custom runtime must disable toolchain unwind library')
         link += ['--target=' + triple, '-Wl,-z,max-page-size=16384', '--unwindlib=none']
+        # Allocator shim's all_dependent_configs require link-time wrappers,
+        # including __real_realpath/getcwd references pulled in by ICU.
+        # Preserve the complete symbol set from this fixed GN graph.
+        wrapper_flags = gn_property(source, out, depot, env,
+                                    '//third_party/partition_alloc/src/partition_alloc:wrap_malloc_symbols', 'ldflags')
+        for flag in dict.fromkeys(official_ldflags + wrapper_flags):
+            if flag.startswith(('-Wl,-wrap,', '-Wl,--wrap=')):
+                if not re.fullmatch(r'-Wl,(?:-wrap,|--wrap=)[A-Za-z_][A-Za-z0-9_]*', flag):
+                    raise ValueError('Invalid official Android allocator wrapper flag')
+                link.append(flag)
         systems = ['dl', 'log', 'm']
     official_libraries = gn_property(source, out, depot, env, '//:v8_monolith', 'libs')
     for library in official_libraries:

@@ -201,10 +201,10 @@ class BuildContractTests(unittest.TestCase):
             builtin.parent.mkdir(parents=True); builtin.write_text('fixed compiler runtime')
             monolith = source / 'libv8_monolith.a'; monolith.write_text('archive')
             runtime = source / 'libv8_cxx_runtime.a'; runtime.write_text('complete upstream libc++/abi/unwind')
-            for official_flags in (['--unwindlib=none', '--sysroot=/build/cache', '-Werror'], []):
+            for official_flags in (['--unwindlib=none', '--sysroot=/build/cache', '-Werror', '-Wl,-wrap,realpath', '-Wl,-wrap,getcwd', '-Wl,--wrap=malloc'], []):
                 with patch.object(builder, 'gn_output', side_effect=[monolith, runtime]), \
                      patch.object(builder, 'inspect_apple_android_archive'), \
-                     patch.object(builder, 'gn_property', side_effect=[official_flags, ['dl']]) as property:
+                     patch.object(builder, 'gn_property', side_effect=[official_flags, ['-Wl,-wrap,realpath', '-Wl,-wrap,getcwd'], ['dl']]) as property:
                     if not official_flags:
                         with self.assertRaisesRegex(ValueError, 'disable toolchain unwind'):
                             builder.apple_android_profile(source, out, 'android-arm64', builder.read_pins(), [], Path('/depot'), {})
@@ -212,8 +212,13 @@ class BuildContractTests(unittest.TestCase):
                     profile = builder.apple_android_profile(source, out, 'android-arm64', builder.read_pins(), [], Path('/depot'), {})
                     self.assertIn('--unwindlib=none', profile['linking']['linkOptions'])
                     self.assertNotIn('--sysroot=/build/cache', profile['linking']['linkOptions'])
+                    self.assertNotIn('-Werror', profile['linking']['linkOptions'])
+                    for flag in ('-Wl,-wrap,realpath', '-Wl,-wrap,getcwd', '-Wl,--wrap=malloc'):
+                        self.assertIn(flag, profile['linking']['linkOptions'])
                     self.assertEqual(list(profile['libraries']), ['lib/libv8_monolith.a', 'lib/libv8_cxx_runtime.a', 'lib/' + builtin.name])
                     self.assertEqual(property.call_args_list[0].args[-1], 'ldflags')
+                    self.assertEqual(property.call_args_list[1].args[-2:],
+                                     ('//third_party/partition_alloc/src/partition_alloc:wrap_malloc_symbols', 'ldflags'))
 
     def test_sdk_abi_options_keep_actual_relative_vtable_flag(self):
         with patch.object(builder, 'gn_property', return_value=['-std=c++20', '-fexperimental-relative-c++-abi-vtables', '--sysroot=/private/cache']):
