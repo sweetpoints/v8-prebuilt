@@ -2,6 +2,7 @@
 """Load a native source_v8 library and exercise its public C ABI."""
 import argparse
 import ctypes
+import hashlib
 import json
 import platform
 from pathlib import Path
@@ -9,7 +10,9 @@ import time
 
 
 def smoke(library, expected_version):
-    lib = ctypes.CDLL(str(Path(library).resolve()))
+    library = Path(library).resolve()
+    library_digest = hashlib.sha256(library.read_bytes()).hexdigest()
+    lib = ctypes.CDLL(str(library))
     lib.sv8_version.argtypes = []
     lib.sv8_version.restype = ctypes.c_char_p
     lib.sv8_create.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -72,7 +75,10 @@ def smoke(library, expected_version):
         if result != {'status': 'error', 'error': 'execution_timeout'}:
             raise RuntimeError(f'{name} failed: {result}')
         cases.append(name)
+    if hashlib.sha256(library.read_bytes()).hexdigest() != library_digest:
+        raise RuntimeError('native library changed during smoke test')
     return {'schemaVersion': 1, 'status': 'passed', 'version': version,
+            'librarySha256': library_digest,
             'host': {'os': platform.system(), 'machine': platform.machine()},
             'cases': cases, 'scope': 'native desktop public C ABI'}
 
