@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the embedded shared bridge from fixed official V8 source and DEPS."""
+"""Build a pure V8 static SDK from exact official V8 and depot_tools pins."""
 import argparse
 from contextlib import contextmanager
 import hashlib
@@ -22,9 +22,6 @@ DEFAULT_OUTPUT_ROOT = ROOT / 'artifacts'
 TARGETS = ('macos-arm64', 'macos-x64', 'android-arm64', 'android-x64',
            'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64',
            'ios-arm64', 'ios-simulator-arm64')
-BRIDGE_EXPORTS = {'sv8_create', 'sv8_start', 'sv8_poll', 'sv8_resolve',
-                  'sv8_sync_poll', 'sv8_sync_reply', 'sv8_cancel', 'sv8_destroy',
-                  'sv8_free', 'sv8_version'}
 
 
 def read_pins(path=None):
@@ -87,23 +84,6 @@ def run(args, cwd, env=None, capture=False):
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def bridge_files():
-    return {name: ROOT / name for name in ('src/source_v8.cpp', 'src/source_v8.h', 'src/android_exports.map')} | {
-        'tool/v8/source_v8.gni': HERE / 'source_v8.gni'}
-
-
-def bridge_digest(files=None):
-    digest = hashlib.sha256()
-    for label, path in sorted((bridge_files() if files is None else files).items()):
-        name = label.encode('utf-8')
-        data = path.read_bytes()
-        digest.update(struct.pack('>Q', len(name)))
-        digest.update(name)
-        digest.update(struct.pack('>Q', len(data)))
-        digest.update(data)
-    return digest.hexdigest()
 
 
 @lru_cache(maxsize=None)
@@ -196,100 +176,12 @@ def gn_arguments(target, pins=None):
             'v8_monolithic_for_shared_library': True, 'v8_use_external_startup_data': False,
             'use_custom_libcxx': True, 'v8_enable_i18n_support': False,
             'v8_enable_temporal_support': False, 'use_remoteexec': False,
-            'symbol_level': 0, 'target_cpu': cpu, 'v8_target_cpu': cpu}
+            'symbol_level': 0, 'use_thin_lto': False, 'target_cpu': cpu, 'v8_target_cpu': cpu}
     if target.startswith('android-'):
         args.update(target_os='android', android_ndk_api_level=26)
     else:
         args.update(target_os='mac', mac_deployment_target='13.0', use_lld=False)
     return '\n'.join(f'{key} = {json.dumps(value)}' for key, value in sorted(args.items())) + '\n'
-
-
-def inspect_android_elf(path, target):
-    """Validate the actual ELF ABI and every LOAD segment's 16 KiB alignment."""
-    if target not in ('android-arm64', 'android-x64'):
-        raise ValueError('ELF inspection requires Android target')
-    data = path.read_bytes()
-    if len(data) < 64 or data[:6] != b'\x7fELF\x02\x01':
-        raise ValueError('Android binary must be little-endian ELF64')
-    machine = struct.unpack_from('<H', data, 18)[0]
-    expected_machine = read_pins()['targets'][target]['elfMachine']
-    if machine != expected_machine:
-        raise ValueError(f'Android ELF machine {machine} differs from {target}')
-    if struct.unpack_from('<H', data, 16)[0] != 3:
-        raise ValueError('Android bridge must be an ELF shared library')
-    offset = struct.unpack_from('<Q', data, 32)[0]
-    size, count = struct.unpack_from('<HH', data, 54)
-    if size < 56 or count == 0 or offset + size * count > len(data):
-        raise ValueError('Invalid Android ELF program headers')
-    alignments = []
-    for index in range(count):
-        position = offset + index * size
-        if struct.unpack_from('<I', data, position)[0] != 1:
-            continue
-        file_offset, address = struct.unpack_from('<QQ', data, position + 8)
-        alignment = struct.unpack_from('<Q', data, position + 48)[0]
-        if alignment < 16384 or alignment & (alignment - 1) or file_offset % 16384 != address % 16384:
-            raise ValueError('Android ELF LOAD segment does not support 16 KiB pages')
-        alignments.append(alignment)
-    if not alignments:
-        raise ValueError('Android ELF has no LOAD segments')
-    return {'elfMachine': machine, 'loadSegmentAlignments': alignments}
-
-
-def validate_android_binary(path, source, target, env):
-    inspection = inspect_android_elf(path, target)
-    tools = source / 'third_party/llvm-build/Release+Asserts/bin'
-    symbols = run([tools / 'llvm-nm', '--dynamic', '--defined-only', '--format=posix', path], source, env, capture=True)
-    exported = {line.split()[0].split('@')[0] for line in symbols.splitlines() if line.strip()}
-    if exported != BRIDGE_EXPORTS:
-        raise ValueError('Android bridge dynamic exports differ from the sv8 ABI')
-    inspection['exports'] = sorted(exported)
-    return inspection
-
-
-
-def inspect_macos_binary(path, target):
-    data = path.read_bytes()
-    if target not in ('macos-arm64', 'macos-x64') or len(data) < 32 or data[:4] != b'\xcf\xfa\xed\xfe':
-        raise ValueError('macOS bridge must be a thin little-endian Mach-O 64 dylib')
-    cpu, _, kind, count, command_bytes = struct.unpack_from('<IIIII', data, 4)
-    expected = 0x0100000C if target == 'macos-arm64' else 0x01000007
-    if cpu != expected or kind != 6:
-        raise ValueError('macOS Mach-O architecture or dylib type mismatch')
-    if 32 + command_bytes > len(data):
-        raise ValueError('Invalid macOS Mach-O load commands')
-    position = 32
-    minimum = None
-    for _ in range(count):
-        if position + 8 > 32 + command_bytes:
-            raise ValueError('Invalid macOS Mach-O load command')
-        command, size = struct.unpack_from('<II', data, position)
-        if size < 8 or position + size > 32 + command_bytes:
-            raise ValueError('Invalid macOS Mach-O load command size')
-        if command == 0x32:
-            if size < 24 or struct.unpack_from('<I', data, position + 8)[0] != 1:
-                raise ValueError('Mach-O build platform must be macOS')
-            minimum = struct.unpack_from('<I', data, position + 12)[0]
-        elif command == 0x24:
-            if size < 16:
-                raise ValueError('Invalid macOS minimum version command')
-            minimum = struct.unpack_from('<I', data, position + 8)[0]
-        position += size
-    if minimum != (13 << 16):
-        raise ValueError('macOS bridge minimum deployment must match pinned 13.0')
-    return {'machCpuType': cpu, 'minMacOS': '13.0'}
-
-
-def validate_macos_binary(path, source, target, env):
-    inspection = inspect_macos_binary(path, target)
-    tools = source / 'third_party/llvm-build/Release+Asserts/bin'
-    symbols = run([tools / 'llvm-nm', '--extern-only', '--defined-only', '--format=posix', path],
-                  source, env, capture=True)
-    exports = {line.split()[0].removeprefix('_') for line in symbols.splitlines() if line.strip()}
-    if exports != BRIDGE_EXPORTS:
-        raise ValueError('macOS bridge exports differ from the sv8 C ABI')
-    inspection['exports'] = sorted(exports)
-    return inspection
 
 
 def source_version(source):
@@ -315,13 +207,6 @@ def package_licenses(source, destination, existing=()):
             raise ValueError(f'License provenance conflict at {label}')
         entries[label] = {'path': label, 'sha256': digest}
         copies.append((path, destination / relative))
-    bridge_license = ROOT / 'LICENSE'
-    bridge_label = 'licenses/source_v8/LICENSE'
-    bridge_hash = sha(bridge_license)
-    if bridge_label in entries and entries[bridge_label]['sha256'] != bridge_hash:
-        raise ValueError('License provenance conflict at ' + bridge_label)
-    entries[bridge_label] = {'path': bridge_label, 'sha256': bridge_hash}
-    copies.append((bridge_license, destination / bridge_label))
     # Preflight all conflicts before replacing any indexed license file.
     for path, output in copies:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -329,125 +214,212 @@ def package_licenses(source, destination, existing=()):
     return [entries[label] for label in sorted(entries)]
 
 
+def gn_property(source, out, depot, env, label, prop, root_target='//sdk_runtime:sdk'):
+    result = json.loads(run([depot_command(depot, 'gn'), 'desc', out, label, prop,
+                             '--format=json', '--root-target=' + root_target], source, env, capture=True))
+    if label not in result or prop not in result[label]:
+        raise ValueError('GN did not report ' + label + ' ' + prop)
+    return result[label][prop]
+
+
+def sdk_defines(source, out, depot, env, root_target='//sdk_runtime:sdk'):
+    public = gn_property(source, out, depot, env, '//:headers_config', 'defines', root_target)
+    compiled = gn_property(source, out, depot, env, '//:v8_monolith', 'defines', root_target)
+    runtime = [value for value in compiled if value == 'NDEBUG' or
+               value.startswith(('_LIBCPP_', '_LIBCXXABI_'))]
+    return list(dict.fromkeys(public + runtime))
+
+
+def gn_output(source, out, depot, env, label):
+    outputs = gn_property(source, out, depot, env, label, 'outputs')
+    if len(outputs) != 1 or not outputs[0].startswith('//'):
+        raise ValueError('Expected one official archive output for ' + label)
+    return source / outputs[0][2:]
+
+
+def sdk_headers(source, out):
+    files = {}
+    for base in (source / 'include', out / 'gen/include'):
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob('*')):
+            if path.is_file():
+                name = (Path('include') / path.relative_to(base)).as_posix()
+                if name in files and sha(files[name]) != sha(path):
+                    raise ValueError('Generated/public V8 header conflict: ' + name)
+                files[name] = path
+    if 'include/v8.h' not in files:
+        raise ValueError('Official public V8 headers are missing')
+    return files
+
+
+def publish_sdk(source, target, pins, files, entry, output_root=None):
+    artifact = Path(DEFAULT_OUTPUT_ROOT if output_root is None else output_root) / pins['v8']['revision']
+    artifact.mkdir(parents=True, exist_ok=True)
+    if entry.get('binary') not in files or 'include/v8.h' not in files or 'linking.json' not in files:
+        raise ValueError('SDK must include its monolith, public V8 header and linking contract')
+    for name, path in files.items():
+        if (not isinstance(name, str) or '\\' in name or ':' in name or name.startswith('/') or
+                any(part in ('', '.', '..') for part in name.split('/')) or not path.is_file()):
+            raise ValueError('Invalid SDK file: ' + str(name))
+    with publication_lock(artifact / '.publish.lock'):
+        manifest_path = artifact / 'manifest.json'
+        previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+        if previous is not None and (previous['v8'] != pins['v8'] or previous['depotTools'] != pins['depotTools']):
+            raise ValueError('Existing SDK manifest source provenance differs')
+        licenses = package_licenses(source, artifact, previous.get('licenses', []) if previous else [])
+        destination = artifact / target
+        destination.mkdir(parents=True, exist_ok=True)
+        index = []
+        for name, path in sorted(files.items()):
+            output = destination / name
+            output.parent.mkdir(parents=True, exist_ok=True)
+            copied_hash = sha(path)
+            shutil.copyfile(path, output)
+            if sha(output) != copied_hash or sha(path) != copied_hash:
+                raise ValueError('SDK file changed while publishing: ' + name)
+            index.append({'path': (Path(target) / name).as_posix(), 'sha256': copied_hash,
+                          'size': output.stat().st_size})
+        result = dict(entry)
+        result['artifactKind'] = 'v8-static-sdk'
+        result['binary'] = (Path(target) / entry['binary']).as_posix()
+        result['sha256'] = sha(artifact / result['binary'])
+        result['size'] = (artifact / result['binary']).stat().st_size
+        result['targetFiles'] = index
+        for name, key in [('args.gn', 'gnArgsSha256'), ('defines.json', 'definesSha256'),
+                          ('dependencies.txt', 'dependencyInventorySha256'), ('linking.json', 'linkingSha256')]:
+            if name in files:
+                result[key] = sha(destination / name)
+        manifest = {'schemaVersion': 1, 'v8': pins['v8'], 'depotTools': pins['depotTools'],
+                    'targets': dict(previous['targets']) if previous else {}, 'licenses': licenses}
+        manifest['targets'][target] = result
+        temporary = manifest_path.with_name('manifest.json.publishing')
+        temporary.write_text(json.dumps(manifest, indent=2) + '\n')
+        os.replace(temporary, manifest_path)
+    print(json.dumps({'manifest': str(manifest_path), 'target': target, 'binarySha256': result['sha256']}))
+    return destination
+
+
+
+def inspect_apple_android_archive(path, target):
+    expected = (0x0100000C if target == 'macos-arm64' else 0x01000007) if target.startswith('macos-') else (183 if target == 'android-arm64' else 62)
+    count = 0
+    total = path.stat().st_size
+    with path.open('rb') as archive:
+        if archive.read(8) != b'!<arch>\n':
+            raise ValueError('SDK requires a complete native static archive')
+        while archive.tell() < total:
+            header = archive.read(60)
+            if len(header) != 60 or header[58:] != b'`\n':
+                raise ValueError('Invalid SDK static archive member')
+            name = header[:16].decode('ascii').strip()
+            size = int(header[48:58].decode('ascii').strip())
+            end = archive.tell() + size
+            if size < 0 or end > total:
+                raise ValueError('Truncated SDK static archive')
+            if name.startswith('#1/'):
+                name_size = int(name[3:])
+                if name_size < 0 or name_size > size:
+                    raise ValueError('Invalid BSD archive name')
+                name = archive.read(name_size).rstrip(b'\0').decode('utf-8')
+            if name not in ('/', '//', '/SYM64/') and not name.startswith('__.SYMDEF'):
+                data = archive.read(min(32, end - archive.tell()))
+                if target.startswith('macos-'):
+                    if len(data) < 16 or data[:4] != b'\xcf\xfa\xed\xfe':
+                        raise ValueError('SDK archive member must be native Mach-O 64')
+                    machine, kind = struct.unpack_from('<I', data, 4)[0], struct.unpack_from('<I', data, 12)[0]
+                else:
+                    if len(data) < 20 or data[:6] != b'\x7fELF\x02\x01':
+                        raise ValueError('SDK archive member must be native ELF64')
+                    kind, machine = struct.unpack_from('<HH', data, 16)
+                if kind != 1 or machine != expected:
+                    raise ValueError('SDK archive relocatable object architecture mismatch')
+                count += 1
+            archive.seek(end + size % 2)
+        final_position = archive.tell()
+    if count == 0 or final_position != total:
+        raise ValueError('SDK archive has no native objects or invalid padding')
+    return {'format': 'static-archive', 'objectMachine': expected, 'objectCount': count}
+
+
+def apple_android_profile(source, out, target, pins, defines, depot, env):
+    monolith = gn_output(source, out, depot, env, '//:v8_monolith')
+    runtime = gn_output(source, out, depot, env, '//sdk_runtime:v8_cxx_runtime')
+    libraries = {'lib/' + monolith.name: monolith, 'lib/' + runtime.name: runtime}
+    for library in libraries.values():
+        inspect_apple_android_archive(library, target)
+    headers = {}
+    for original, prefix in [(source / 'third_party/libc++/src/include', 'runtime/include/c++'),
+                             (source / 'third_party/libc++abi/src/include', 'runtime/include/abi')]:
+        for path in original.rglob('*'):
+            if path.is_file():
+                headers[(Path(prefix) / path.relative_to(original)).as_posix()] = path
+    site = out / 'gen/buildtools/third_party/libc++/__config_site'
+    if not site.is_file():
+        site = source / 'buildtools/third_party/libc++/__config_site'
+    if not site.is_file():
+        raise ValueError('Pinned libc++ configuration header missing')
+    headers['runtime/include/config/__config_site'] = site
+    options = ['-std=c++20', '-fno-rtti', '-fno-exceptions', '-nostdinc++', '-fPIC']
+    link = ['-nostdlib++']
+    if target.startswith('macos-'):
+        triple = ('arm64' if target == 'macos-arm64' else 'x86_64') + '-apple-macos13.0'
+        options += ['--target=' + triple, '-mmacosx-version-min=13.0']
+        link += ['--target=' + triple, '-mmacosx-version-min=13.0']
+        systems = ['pthread']
+    else:
+        triple = ('aarch64' if target == 'android-arm64' else 'x86_64') + '-linux-android26'
+        options += ['--target=' + triple]
+        link += ['--target=' + triple, '-Wl,-z,max-page-size=16384']
+        systems = ['dl', 'log', 'm', 'pthread']
+    return {'libraries': libraries, 'runtimeHeaders': headers, 'linking': {
+        'schemaVersion': 1, 'includeDirs': ['include', 'runtime/include/config', 'runtime/include/c++', 'runtime/include/abi'],
+        'defines': defines, 'compileOptions': options, 'libraries': list(libraries),
+        'linkOptions': link, 'systemLibraries': systems,
+        'compilerStyle': 'clang++', 'cxxRuntime': 'pinned Chromium libc++ (__Cr ABI)',
+        'sysrootRequirement': ({'kind': 'apple-macos-sdk', 'minOS': '13.0'} if target.startswith('macos-') else
+                               {'kind': 'android-ndk-sysroot', 'minApi': 26, 'target': triple})}}
+
+
 def build(source, depot, env, target, jobs, pins, output_root=None):
     if target.startswith('ios-'):
         return platform_module('ios').build(source, depot, env, target, jobs, pins, output_root)
-    desktop = platform_module('desktop') if target.startswith(('linux-', 'windows-')) else None
-    if desktop is not None:
+    desktop = platform_module('desktop')
+    if target.startswith(('linux-', 'windows-')):
         env = desktop.environment(target, env)
         desktop.prepare(source, depot, env, target, run)
     if source_version(source) != pins['v8']['version']:
         raise ValueError('Official source version differs from pins')
-    compiled_bridge_digest = bridge_digest()
-    overlay = source / 'source_v8'
-    overlay.mkdir(exist_ok=True)
-    for label, path in bridge_files().items():
-        shutil.copyfile(path, overlay / path.name)
-    copied_files = {label: overlay / path.name for label, path in bridge_files().items()}
-    if bridge_digest(copied_files) != compiled_bridge_digest:
-        raise ValueError('Bridge source changed while copying build overlay')
-    platform_inputs = {}
-    if desktop is not None:
-        platform_inputs = desktop.create_overlay(source, BRIDGE_EXPORTS)
-    else:
-        (overlay / 'BUILD.gn').write_text('import("//source_v8/source_v8.gni")\nsource_v8_library("source_v8") {}\n')
-    platform_digest = bridge_digest(platform_inputs) if platform_inputs else None
-    out = source / ({'android-x64': 'out/source_v8_android_x64',
-                     'macos-x64': 'out/source_v8_macos_x64'}.get(target, 'out/source_v8'))
-    if desktop is not None:
-        out = desktop.output_directory(source, target)
+    build_inputs = desktop.create_runtime_target(source)
+    out = source / ('out/v8_sdk_' + target.replace('-', '_'))
     out.mkdir(parents=True, exist_ok=True)
     args = gn_arguments(target, pins)
     (out / 'args.gn').write_text(args)
-    run([depot_command(depot, 'gn'), 'gen', out, '--root-target=//source_v8:source_v8', '--fail-on-unused-args'], source, env)
-    run([depot_command(depot, 'autoninja'), '-C', out, '-j', jobs, 'source_v8:source_v8'], source, env)
-    suffix = '.dylib' if target.startswith('macos-') else '.so'
-    built = out / (desktop.binary_name(target) if desktop is not None else 'libsource_v8' + suffix)
-    if not built.is_file():
-        raise ValueError('Shared bridge output missing')
-    inspection = (desktop.validate_binary(built, source, target, env, run) if desktop is not None else
-                  validate_android_binary(built, source, target, env) if target.startswith('android-') else
-                  validate_macos_binary(built, source, target, env))
-    artifact = Path(DEFAULT_OUTPUT_ROOT if output_root is None else output_root) / pins['v8']['revision']
-    artifact.mkdir(parents=True, exist_ok=True)
-    with publication_lock(artifact / '.publish.lock'):
-        if bridge_digest() != compiled_bridge_digest or bridge_digest(copied_files) != compiled_bridge_digest:
-            raise ValueError('Bridge source or compiled overlay changed during build; refusing publication')
-        if platform_digest is not None and bridge_digest(platform_inputs) != platform_digest:
-            raise ValueError('Platform overlay changed during build; refusing publication')
-        manifest_path = artifact / 'manifest.json'
-        previous = None
-        if manifest_path.exists():
-            previous = json.loads(manifest_path.read_text())
-            if (previous['v8'] != pins['v8'] or previous['depotTools'] != pins['depotTools']
-                    or previous['bridge'] != {'abi': 1, 'sourceSha256': compiled_bridge_digest}):
-                raise ValueError('Existing artifact manifest provenance differs; use clean artifact directory')
-        licenses = package_licenses(source, artifact, previous.get('licenses', []) if previous else [])
-        destination = artifact / target
-        destination.mkdir(parents=True, exist_ok=True)
-        binary = destination / built.name
-        temporary = binary.with_name(binary.name + '.publishing')
-        shutil.copyfile(built, temporary)
-        os.replace(temporary, binary)
-        header = destination / 'include/source_v8.h'
-        header.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(overlay / 'source_v8.h', header)
-        (destination / 'args.gn').write_text(args)
-        revinfo = run([depot_command(depot, 'gclient'), 'revinfo', '--actual'], source.parent, env, capture=True)
-        (destination / 'dependencies.txt').write_text(revinfo)
-        defines = run([depot_command(depot, 'gn'), 'desc', out, '//source_v8:source_v8', 'defines', '--format=json',
-                       '--root-target=//source_v8:source_v8'], source, env, capture=True)
-        (destination / 'defines.json').write_text(defines)
-        clang = source / ('third_party/llvm-build/Release+Asserts/bin/clang-cl.exe'
-                          if target.startswith('windows-') else
-                          'third_party/llvm-build/Release+Asserts/bin/clang++')
-        toolchain = {'clang': run([clang, '--version'], source, env, capture=True).strip(),
-                     'gn': run([depot_command(depot, 'gn'), '--version'], source, env, capture=True).strip()}
-        if target.startswith('macos-'):
-            toolchain['appleLinker'] = run(['xcrun', 'ld', '-v'], source, env, capture=True).strip()
-            toolchain['xcode'] = run(['xcodebuild', '-version'], source, env, capture=True).strip()
-            toolchain['macSdk'] = run(['xcrun', '--sdk', 'macosx', '--show-sdk-version'], source, env, capture=True).strip()
-        entry = {'artifactKind': 'shared-bridge', 'binary': (Path(target) / binary.name).as_posix(), 'sha256': sha(binary), 'size': binary.stat().st_size,
-                 'header': (Path(target) / 'include/source_v8.h').as_posix(), 'headerSha256': sha(header),
-                 'host': {'os': platform.system(), 'cpu': platform.machine()},
-                 'gnArgs': args, 'gnArgsSha256': sha(destination / 'args.gn'),
-                 'depsSha256': sha(source / 'DEPS'), 'dependencyInventorySha256': sha(destination / 'dependencies.txt'),
-                 'definesSha256': sha(destination / 'defines.json'), 'toolchain': toolchain,
-                 'validation': {'built': True, 'runtimeTested': False, 'sourceCompatibilityTested': False}}
-        if platform_digest is not None:
-            entry['platformBuildInputSha256'] = platform_digest
-            entry['platformBuildInputs'] = []
-            for label, path in sorted(platform_inputs.items()):
-                relative = Path(target) / 'build-inputs' / Path(label).name
-                destination_input = artifact / relative
-                destination_input.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(path, destination_input)
-                entry['platformBuildInputs'].append({'path': relative.as_posix(), 'sha256': sha(destination_input), 'label': label})
-        if target.startswith('macos-'):
-            entry['minMacOS'] = '13.0'
-            entry['binaryInspection'] = inspection
-        elif target.startswith('android-'):
-            entry['minApi'] = pins['targets'][target]['minApi']
-            entry['abi'] = pins['targets'][target]['abi']
-            entry['binaryInspection'] = inspection
-        else:
-            entry['binaryInspection'] = inspection
-        produced = [binary, header, destination / 'args.gn', destination / 'dependencies.txt',
-                    destination / 'defines.json']
-        produced += [artifact / item['path'] for item in entry.get('platformBuildInputs', [])]
-        entry['targetFiles'] = [{'path': path.relative_to(artifact).as_posix(),
-                                 'sha256': sha(path), 'size': path.stat().st_size}
-                                for path in sorted(produced)]
-        manifest = {'schemaVersion': 1, 'v8': pins['v8'], 'depotTools': pins['depotTools'],
-                    'bridge': {'abi': 1, 'sourceSha256': compiled_bridge_digest}, 'targets': {}}
-        if previous is not None:
-            manifest['targets'] = previous['targets']
-        manifest['targets'][target] = entry
-        manifest['licenses'] = licenses
-        temporary_manifest = manifest_path.with_name('manifest.json.publishing')
-        temporary_manifest.write_text(json.dumps(manifest, indent=2) + '\n')
-        os.replace(temporary_manifest, manifest_path)
-        print(json.dumps({'manifest': str(manifest_path), 'target': target, 'binarySha256': entry['sha256']}))
+    run([depot_command(depot, 'gn'), 'gen', out, '--root-target=//sdk_runtime:sdk', '--fail-on-unused-args'], source, env)
+    run([depot_command(depot, 'autoninja'), '-C', out, '-j', jobs, 'v8_monolith', 'sdk_runtime:v8_cxx_runtime'], source, env)
+    defines = sdk_defines(source, out, depot, env)
+    profile = (desktop.sdk_profile(source, out, target, pins, defines, run, depot_command(depot, 'gn'), env)
+               if target.startswith(('linux-', 'windows-')) else
+               apple_android_profile(source, out, target, pins, defines, depot, env))
+    files = sdk_headers(source, out) | profile['libraries'] | profile['runtimeHeaders']
+    files |= {'build-inputs/' + path.name: path for path in build_inputs.values()}
+    metadata = out / 'sdk-metadata'
+    metadata.mkdir(exist_ok=True)
+    (metadata / 'linking.json').write_text(json.dumps(profile['linking'], indent=2) + '\n')
+    (metadata / 'defines.json').write_text(json.dumps(defines, indent=2) + '\n')
+    inventory = run([depot_command(depot, 'gclient'), 'revinfo', '--actual'], source.parent, env, capture=True)
+    (metadata / 'dependencies.txt').write_text(inventory)
+    files |= {'linking.json': metadata / 'linking.json', 'defines.json': metadata / 'defines.json',
+              'dependencies.txt': metadata / 'dependencies.txt', 'args.gn': out / 'args.gn'}
+    compiler = source / ('third_party/llvm-build/Release+Asserts/bin/clang-cl.exe' if target.startswith('windows-')
+                         else 'third_party/llvm-build/Release+Asserts/bin/clang++')
+    entry = {'binary': next(name for name in profile['libraries'] if 'v8_monolith' in name),
+             'gnArgs': args, 'depsSha256': sha(source / 'DEPS'), 'targetConfig': pins['targets'][target],
+             'host': {'os': platform.system(), 'cpu': platform.machine()},
+             'toolchain': {'clang': run([compiler, '--version'], source, env, capture=True).strip(),
+                           'gn': run([depot_command(depot, 'gn'), '--version'], source, env, capture=True).strip()},
+             'validation': {'built': True, 'linkTested': False, 'runtimeTested': False}}
+    return publish_sdk(source, target, pins, files, entry, output_root)
 
 
 def main():
