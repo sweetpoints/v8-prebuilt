@@ -77,6 +77,16 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual('--arch=arm64', calls[0][0][-1])
         desktop.prepare(Path('v8'), Path('depot'), {}, 'windows-arm64', lambda *args, **kwargs: self.fail('unexpected sysroot download'))
 
+    def test_windows_bootstrap_generates_official_git_wrappers_before_gclient(self):
+        calls = []
+        env = {'DEPOT_TOOLS_UPDATE': '0', 'DEPOT_TOOLS_WIN_TOOLCHAIN': '0'}
+        depot = Path('pinned-depot')
+        desktop.initialize_depot_windows(depot, env, lambda *args, **kwargs: calls.append(args))
+        self.assertEqual(['cmd.exe', '/d', '/c', depot / 'bootstrap/win_tools.bat'], calls[0][0])
+        self.assertEqual(['cmd.exe', '/d', '/c', depot / 'gclient.bat', '--version'], calls[1][0])
+        self.assertTrue(all(call[2] == env for call in calls))
+        self.assertEqual('0', env['DEPOT_TOOLS_UPDATE'])
+
     def test_overlay_exports_and_preserves_bridge_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

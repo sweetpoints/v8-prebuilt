@@ -148,7 +148,14 @@ def validate_binary(path, source, target, env, run):
 
 
 def initialize_depot_windows(depot, env, run):
-    """Let official gclient.bat bootstrap pinned depot_tools Python/CIPD."""
+    """Initialize official pinned CIPD/Python/Git wrappers without updating source.
+
+    DEPOT_TOOLS_UPDATE=0 skips update_depot_tools.bat, which normally invokes
+    bootstrap/win_tools.bat. gclient's git_cache still requires git.bat, even
+    when Git for Windows is already installed. Run the official bootstrap
+    directly rather than enabling automatic source updates.
+    """
+    run(['cmd.exe', '/d', '/c', Path(depot) / 'bootstrap/win_tools.bat'], depot, env)
     run(['cmd.exe', '/d', '/c', Path(depot) / 'gclient.bat', '--version'], depot, env)
 
 
