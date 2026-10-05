@@ -37,8 +37,10 @@ class IOSContractTest(unittest.TestCase):
             self.assertIn('target_cpu = "arm64"', args)
             for flag in ['v8_jitless = true', 'use_custom_libcxx = false', 'v8_enable_pointer_compression = false',
                          'v8_enable_sandbox = false', 'v8_enable_webassembly = false', 'is_component_build = false',
-                         'v8_use_external_startup_data = false', 'v8_monolithic_for_shared_library = false']:
+                         'v8_use_external_startup_data = false', 'v8_monolithic_for_shared_library = false',
+                         'ios_enable_code_signing = false', 'use_thin_lto = false']:
                 self.assertIn(flag, args)
+            self.assertNotIn('use_system_xcode =', args)
         self.assertNotEqual(ios.output_directory(Path('/source'), 'ios-arm64'), ios.output_directory(Path('/source'), 'ios-simulator-arm64'))
 
     def test_invalid_platform_host_and_version_rejected(self):
@@ -52,15 +54,12 @@ class IOSContractTest(unittest.TestCase):
             with self.assertRaises(ValueError): ios.require_host('ios-arm64')
         with self.assertRaises(ValueError): ios.target_os('macos-arm64')
 
-    def test_jitless_overlay_precedes_initialization_without_mutating_base(self):
-        base = 'prefix\n    V8::InitializePlatform(runtime_platform.get());\n    V8::Initialize();'
-        derived = ios.platform_source(base)
-        self.assertIn('V8::SetFlagsFromString("--jitless");\n    V8::InitializePlatform', derived)
-        self.assertNotIn('SetFlagsFromString', base)
-        for invalid in ['', base + base]:
-            with self.assertRaises(ValueError): ios.platform_source(invalid)
-        self.assertIn('static_library(', ios.STATIC_GN)
-        self.assertNotIn('shared_library(', ios.STATIC_GN)
+    def test_probe_uses_only_official_v8_api_and_initializes_jitless(self):
+        self.assertIn('#include "v8.h"', ios.LINK_SMOKE)
+        self.assertIn('v8::platform::NewDefaultPlatform()', ios.LINK_SMOKE)
+        self.assertIn('v8::Script::Compile', ios.LINK_SMOKE)
+        self.assertLess(ios.LINK_SMOKE.index('SetFlagsFromString("--jitless")'), ios.LINK_SMOKE.index('InitializePlatform'))
+        self.assertNotIn('sv8_', ios.LINK_SMOKE)
 
     def test_platform_archive_rejects_host_and_dylib_objects(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -86,27 +85,51 @@ class IOSContractTest(unittest.TestCase):
             path.write_bytes(b'!<arch>\n' + symbols + member[8:])
             self.assertEqual(ios.inspect_static_archive(path, 'ios-arm64')['objectCount'], 1)
 
-    def test_exact_bridge_exports_required(self):
+    def test_archive_validation_does_not_require_an_app_bridge(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'lib.a'
             path.write_bytes(archive_bytes(object_bytes()))
-            run = lambda *args, **kwargs: '\n'.join('000 T _' + name for name in ios.common.BRIDGE_EXPORTS)
-            self.assertEqual(len(ios.validate_binary(path, Path(directory), 'ios-arm64', {}, run)['bridgeExports']), 10)
-            with self.assertRaises(ValueError): ios.validate_binary(path, Path(directory), 'ios-arm64', {}, lambda *a, **k: '_sv8_create')
+            with patch('ios.common.run', side_effect=AssertionError('No C ABI inspection expected')):
+                self.assertEqual(ios.validate_binary(path, Path(directory), 'ios-arm64', {})['platform'], 2)
 
     def test_link_contract_is_unambiguous_static_system_libcxx(self):
         for target in ios.TARGETS:
             contract = ios.link_contract(target, PINS, ['V8_JITLESS'])
+            self.assertEqual(contract['schemaVersion'], 1)
             self.assertFalse(contract['dynamicLoading'])
-            self.assertTrue(contract['linkExactlyOneArchive'])
             self.assertEqual(contract['runtimeFlags'], ['--jitless'])
-            self.assertEqual(contract['bridgeArchive'], 'lib/libsource_v8.a')
+            self.assertEqual(contract['libraries'], ['lib/libv8_monolith.a'])
+            self.assertEqual(contract['includeDirs'], ['include'])
+            self.assertEqual(contract['defines'], ['V8_JITLESS'])
+            self.assertEqual(contract['systemLibraries'], ['c++'])
             self.assertIn('system; not bundled', contract['stdlib'])
             self.assertFalse(contract['externalStartupData'])
-            for name in ios.common.BRIDGE_EXPORTS:
-                self.assertIn('-Wl,-u,_' + name, contract['bridgeLinkArguments'])
-                self.assertIn('-Wl,-exported_symbol,_' + name, contract['bridgeLinkArguments'])
+            self.assertNotIn('bridgeArchive', contract)
             self.assertEqual(contract['clangTarget'].endswith('-simulator'), target == 'ios-simulator-arm64')
+
+    def test_probe_links_published_archive_and_defines_and_preserves_evidence(self):
+        # Command/inspection test only; real V8 SDK link is mandatory in build().
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for target in ios.TARGETS:
+                sdk_dir = root / target
+                sdk_dir.mkdir()
+                contract = ios.link_contract(target, PINS, ['V8_JITLESS'])
+                (sdk_dir / 'linking.json').write_text(json.dumps(contract))
+                commands = []
+                def run(args, *unused, **kwargs):
+                    commands.append([str(arg) for arg in args])
+                    if '--show-sdk-path' in args: return '/Apple/SDK'
+                    Path(args[-1]).write_bytes(object_bytes(ios.PLATFORMS[target], filetype=2))
+                with patch('ios.common.run', side_effect=run):
+                    proof = ios.link_smoke(sdk_dir, root, target, PINS, {})
+                self.assertTrue(proof['passed'])
+                self.assertFalse(proof['runtimeExecuted'])
+                self.assertIn('-DV8_JITLESS', commands[-1])
+                self.assertIn(str(sdk_dir / 'lib/libv8_monolith.a'), commands[-1])
+                self.assertFalse(any('sv8_' in arg for command in commands for arg in command))
+                for name in ['link-smoke', 'link-smoke.cpp', 'link-smoke.json']:
+                    self.assertTrue((sdk_dir / 'validation' / name).is_file())
 
     def test_inventory_indexes_every_file_by_content(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -135,37 +158,6 @@ class AppleSDKObjectTest(unittest.TestCase):
                 subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), str(obj)], check=True)
                 self.assertEqual(ios.inspect_static_archive(archive, target)['platform'], ios.PLATFORMS[target])
 
-    def test_real_apple_link_probe_is_preserved_without_claiming_v8_runtime(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for target in ios.TARGETS:
-                sdk_dir = root / target
-                (sdk_dir / 'include').mkdir(parents=True)
-                (sdk_dir / 'lib').mkdir()
-                shutil.copyfile(ios.common.ROOT / 'src/source_v8.h', sdk_dir / 'include/source_v8.h')
-                stub = sdk_dir / 'stub.cpp'
-                stub.write_text('#include "source_v8.h"\n'
-                    'void *sv8_create(int,int){return nullptr;}\n'
-                    'void sv8_start(void*,const char*,const char*,const char*){}\n'
-                    'char *sv8_poll(void*){return nullptr;}\n'
-                    'void sv8_cancel(void*){}\nvoid sv8_destroy(void*){}\n'
-                    'void sv8_resolve(void*,int,const char*,int){}\n'
-                    'char *sv8_sync_poll(void*){return nullptr;}\n'
-                    'void sv8_sync_reply(void*,int,const char*,int){}\n'
-                    'void sv8_free(char*){}\nconst char *sv8_version(){return "stub";}\n')
-                sdk = subprocess.check_output(['xcrun', '--sdk', ios.SDKS[target], '--show-sdk-path'], text=True).strip()
-                obj = sdk_dir / 'stub.o'
-                contract = ios.link_contract(target, PINS, [])
-                subprocess.run(['xcrun', 'clang++', '-target', contract['clangTarget'], '-isysroot', sdk,
-                    '-I', str(sdk_dir / 'include'), '-c', str(stub), '-o', str(obj)], check=True)
-                subprocess.run(['xcrun', 'libtool', '-static', '-o', str(sdk_dir / 'lib/libsource_v8.a'), str(obj)], check=True)
-                (sdk_dir / 'linking.json').write_text(json.dumps(contract))
-                proof = ios.link_smoke(sdk_dir, root, target, PINS, dict(os.environ))
-                self.assertTrue(proof['passed'])
-                self.assertFalse(proof['runtimeExecuted'])
-                self.assertEqual(proof['executableInspection']['platform'], ios.PLATFORMS[target])
-                for name in ['link-smoke', 'link-smoke.cpp', 'link-smoke.json']:
-                    self.assertTrue((sdk_dir / 'validation' / name).is_file())
 
 
 if __name__ == '__main__': unittest.main()
