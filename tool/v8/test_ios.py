@@ -103,6 +103,9 @@ class IOSContractTest(unittest.TestCase):
             self.assertEqual(contract['bridgeArchive'], 'lib/libsource_v8.a')
             self.assertIn('system; not bundled', contract['stdlib'])
             self.assertFalse(contract['externalStartupData'])
+            for name in ios.common.BRIDGE_EXPORTS:
+                self.assertIn('-Wl,-u,_' + name, contract['bridgeLinkArguments'])
+                self.assertIn('-Wl,-exported_symbol,_' + name, contract['bridgeLinkArguments'])
             self.assertEqual(contract['clangTarget'].endswith('-simulator'), target == 'ios-simulator-arm64')
 
     def test_inventory_indexes_every_file_by_content(self):
@@ -146,6 +149,9 @@ class AppleSDKObjectTest(unittest.TestCase):
                     'void sv8_start(void*,const char*,const char*,const char*){}\n'
                     'char *sv8_poll(void*){return nullptr;}\n'
                     'void sv8_cancel(void*){}\nvoid sv8_destroy(void*){}\n'
+                    'void sv8_resolve(void*,int,const char*,int){}\n'
+                    'char *sv8_sync_poll(void*){return nullptr;}\n'
+                    'void sv8_sync_reply(void*,int,const char*,int){}\n'
                     'void sv8_free(char*){}\nconst char *sv8_version(){return "stub";}\n')
                 sdk = subprocess.check_output(['xcrun', '--sdk', ios.SDKS[target], '--show-sdk-path'], text=True).strip()
                 obj = sdk_dir / 'stub.o'

@@ -192,7 +192,9 @@ def link_contract(target, pins, defines):
         'clangTarget': 'arm64-apple-ios' + config['minIOS'] + ('-simulator' if target.endswith('simulator-arm64') else ''),
         'bridgeArchive': 'lib/libsource_v8.a', 'nativeV8Archive': 'lib/libv8_monolith.a',
         'linkExactlyOneArchive': True,
-        'bridgeLinkArguments': ['-Wl,-force_load,lib/libsource_v8.a', '-lc++', '-framework', 'Foundation', '-framework', 'CoreFoundation'],
+        'bridgeLinkArguments': ['-Wl,-force_load,lib/libsource_v8.a', '-lc++', '-framework', 'Foundation', '-framework', 'CoreFoundation']
+            + [flag for symbol in sorted(common.BRIDGE_EXPORTS)
+               for flag in ('-Wl,-u,_' + symbol, '-Wl,-exported_symbol,_' + symbol)],
         'includeDirectories': ['include', 'include/v8'], 'v8PublicDefines': defines,
         'cxxStandard': 'c++20', 'stdlib': 'Xcode SDK libc++ (system; not bundled)',
         'runtimeFlags': ['--jitless'], 'compileTimeJitless': True, 'webAssembly': False,
@@ -211,8 +213,15 @@ def link_smoke(directory, source, target, pins, env):
     common.run(['xcrun', '--sdk', SDKS[target], 'clang++', '-std=c++20', '-target', contract['clangTarget'],
                 '-isysroot', sdk, '-I', directory / 'include', probe,
                 '-Wl,-force_load,' + str(directory / 'lib/libsource_v8.a'), '-lc++',
-                '-framework', 'Foundation', '-framework', 'CoreFoundation', '-o', output], source, env)
+                '-framework', 'Foundation', '-framework', 'CoreFoundation', '-Wl,-dead_strip',
+                *[flag for symbol in sorted(common.BRIDGE_EXPORTS)
+                  for flag in ('-Wl,-u,_' + symbol, '-Wl,-exported_symbol,_' + symbol)], '-o', output], source, env)
     inspection = inspect_macho(output.read_bytes(), target, filetype=2)
+    exported_text = common.run(['xcrun', 'nm', '-gU', output], source, env, capture=True)
+    exports = {line.split()[-1].removeprefix('_') for line in exported_text.splitlines() if line.strip()}
+    if not common.BRIDGE_EXPORTS.issubset(exports):
+        raise ValueError('Dead-stripped iOS executable is missing C ABI symbols')
+    inspection['bridgeExports'] = sorted(common.BRIDGE_EXPORTS)
     result = {'passed': True, 'executableInspection': inspection, 'runtimeExecuted': False,
               'source': 'validation/link-smoke.cpp', 'executable': 'validation/link-smoke'}
     (evidence / 'link-smoke.json').write_text(json.dumps(result, indent=2) + '\n')
