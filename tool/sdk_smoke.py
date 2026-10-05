@@ -108,6 +108,12 @@ def compile_probe(root, contract, compiler, output, source, sysroot=None):
         raise ValueError('SDK requires an explicit matching target sysroot')
     include = [sdk_path(root, item) for item in contract['includeDirs']]
     libraries = [sdk_path(root, item) for item in contract['libraries']]
+    grouping = contract.get('staticLibraryGrouping', 'normal')
+    if grouping not in ('normal', 'rescan'):
+        raise ValueError('unsupported static library grouping')
+    if grouping == 'rescan' and (style != 'clang++' or requirement.get('kind') not in
+                                 ('chromium-linux-sysroot', 'android-ndk', 'android-ndk-sysroot')):
+        raise ValueError('archive rescan groups require a Linux or Android SDK')
     if style == 'clang-cl':
         if sysroot is not None:
             raise ValueError('clang-cl uses the Windows SDK environment rather than --sysroot')
@@ -126,7 +132,10 @@ def compile_probe(root, contract, compiler, output, source, sysroot=None):
         args += ['-I' + str(path) for path in include]
         args += ['-D' + value for value in contract['defines']]
         args += contract['compileOptions'] + [str(source)]
-        args += [str(path) for path in libraries] + contract['linkOptions']
+        library_args = [str(path) for path in libraries]
+        if grouping == 'rescan':
+            library_args = ['-Wl,--start-group', *library_args, '-Wl,--end-group']
+        args += library_args + contract['linkOptions']
         args += ['-l' + name for name in contract['systemLibraries']]
         args += ['-o', str(output)]
     else:
