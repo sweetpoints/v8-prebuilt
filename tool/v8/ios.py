@@ -226,7 +226,7 @@ def link_contract(target, pins, defines, frameworks=(), system_libraries=(), arc
 def link_smoke(directory, source, target, pins, env):
     contract = json.loads((directory / 'linking.json').read_text())
     evidence = directory / 'validation'
-    evidence.mkdir()
+    evidence.mkdir(exist_ok=True)
     probe = evidence / 'link-smoke.cpp'
     probe.write_text(LINK_SMOKE)
     sdk = common.run(['xcrun', '--sdk', SDKS[target], '--show-sdk-path'], source, env, capture=True).strip()
@@ -272,6 +272,10 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
     frameworks = common.gn_property(source, out, depot, env, '//:v8_monolith', 'frameworks', root_target='//:v8_monolith')
     gn_libraries = common.gn_property(source, out, depot, env, '//:v8_monolith', 'libs', root_target='//:v8_monolith')
     archives, system_libraries = collect_link_libraries(source, gn_libraries)
+    archives = {name: common.sdk_archive_dependency(source, out, path, target, env)
+                for name, path in archives.items()}
+    rust_runtime, rust_evidence = common.sdk_rust_runtime(source, out, target, env)
+    archives = {'lib/libv8_rust_runtime.a': rust_runtime, **archives}
     with tempfile.TemporaryDirectory(prefix='v8-ios-sdk-') as staging:
         directory = Path(staging)
         files = common.sdk_headers(source, out)
@@ -283,8 +287,11 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
         shutil.copyfile(monolith, directory / 'lib/libv8_monolith.a')
         for relative, original in archives.items():
             shutil.copyfile(original, directory / relative)
+        (directory / 'validation').mkdir()
+        shutil.copyfile(rust_evidence, directory / 'validation/rust-runtime.json')
         inspection = validate_binary(directory / 'lib/libv8_monolith.a', source, target, env)
-        for minimum in inspection['objectMinIOS']:
+        rust_inspection = validate_binary(directory / 'lib/libv8_rust_runtime.a', source, target, env)
+        for minimum in [*inspection['objectMinIOS'], *rust_inspection['objectMinIOS']]:
             expected = tuple(map(int, pins['targets'][target]['minIOS'].split('.')))
             expected = expected + (0,) * (3 - len(expected))
             if tuple(map(int, minimum.split('.'))) > expected:
@@ -311,6 +318,7 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
             'definesSha256': common.sha(directory / 'defines.json'), 'toolchain': toolchain,
             'minIOS': pins['targets'][target]['minIOS'], 'environment': pins['targets'][target]['environment'],
             'platformBuildInputSha256': build_inputs_digest, 'binaryInspection': inspection,
+            'rustRuntimeInspection': rust_inspection,
             'validation': {'built': True, 'linkTested': True, 'runtimeTested': False, 'sourceCompatibilityTested': False},
             'linkSmoke': smoke,
         }

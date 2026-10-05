@@ -178,6 +178,10 @@ class IOSContractTest(unittest.TestCase):
             runtime = source / 'third_party/llvm/libclang_rt.ios.a'
             runtime.parent.mkdir(parents=True)
             runtime.write_bytes(archive_bytes(object_bytes()))
+            rust = out / 'libv8_rust_runtime.a'
+            rust.write_bytes(archive_bytes(object_bytes()))
+            rust_evidence = out / 'rust-runtime.json'
+            rust_evidence.write_text('{"nativeObjects":1}')
             pins = copy.deepcopy(PINS)
             pins['v8'] = {'version': '15.4.80.25'}
             expected_args = ios.gn_arguments('ios-arm64', pins)
@@ -188,24 +192,33 @@ class IOSContractTest(unittest.TestCase):
             def publish(src, target, actual_pins, files, entry, output_root):
                 self.assertEqual(target, 'ios-arm64')
                 self.assertEqual(set(files), {'include/v8.h', 'lib/libv8_monolith.a',
-                    'linking.json', 'args.gn', 'defines.json', 'dependencies.txt', 'lib/libclang_rt.ios.a'})
+                    'linking.json', 'args.gn', 'defines.json', 'dependencies.txt', 'lib/libclang_rt.ios.a',
+                    'lib/libv8_rust_runtime.a', 'validation/rust-runtime.json'})
                 self.assertEqual(files['lib/libclang_rt.ios.a'].read_bytes(), runtime.read_bytes())
                 linking = json.loads(files['linking.json'].read_text())
-                self.assertIn('lib/libclang_rt.ios.a', linking['libraries'])
+                self.assertEqual(linking['libraries'], ['lib/libv8_monolith.a',
+                    'lib/libv8_rust_runtime.a', 'lib/libclang_rt.ios.a'])
+                self.assertEqual(files['lib/libv8_rust_runtime.a'].read_bytes(), rust.read_bytes())
+                self.assertEqual(files['validation/rust-runtime.json'].read_text(), rust_evidence.read_text())
                 self.assertNotIn('//third_party/llvm/libclang_rt.ios.a', linking['systemLibraries'])
                 self.assertEqual(files['args.gn'].read_text(), expected_args)
                 self.assertRegex(entry['platformBuildInputSha256'], r'^[0-9a-f]{64}$')
                 self.assertFalse(entry['validation']['runtimeTested'])
+                self.assertEqual(entry['rustRuntimeInspection']['platform'], 2)
                 return Path(directory) / 'published'
             with patch('ios.require_host'), patch('ios.common.source_version', return_value='15.4.80.25'), \
                  patch('ios.common.run', side_effect=run), patch('ios.output_for', return_value=archive), \
                  patch('ios.common.sdk_defines', return_value=['V8_TARGET_OS_IOS']) as defines, \
                  patch('ios.common.gn_property', side_effect=[[], ['//third_party/llvm/libclang_rt.ios.a']]), \
                  patch('ios.common.sdk_headers', return_value={'include/v8.h': header}), \
+                 patch('ios.common.sdk_rust_runtime', return_value=(rust, rust_evidence)) as rust_helper, \
+                 patch('ios.common.sdk_archive_dependency', return_value=runtime) as dependency, \
                  patch('ios.link_smoke', return_value={'passed': True, 'runtimeExecuted': False}), \
                  patch('ios.common.publish_sdk', side_effect=publish):
                 self.assertEqual(ios.build(source, source / 'depot', {}, 'ios-arm64', 2, pins), Path(directory) / 'published')
                 self.assertEqual(defines.call_args.kwargs['root_target'], '//:v8_monolith')
+                self.assertEqual(rust_helper.call_args.args, (source, out, 'ios-arm64', {}))
+                self.assertEqual(dependency.call_args.args, (source, out, runtime.resolve(), 'ios-arm64', {}))
             self.assertTrue(any(command[-1] == 'v8_monolith' for command in commands))
             self.assertFalse(any('source_v8:source_v8' in arg for command in commands for arg in command))
 
