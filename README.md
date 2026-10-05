@@ -1,6 +1,7 @@
 # v8-prebuilt
 
-Build the official V8 stable source and publish checksummed **pure V8 SDKs** for
+Build the official V8 stable source with its complete stable feature profile
+and publish checksummed **pure V8 SDKs** for
 Android, iOS, macOS, Linux and Windows. Each target SDK supplies the official V8
 monolithic static library, public C++ headers and recorded compiler/linking inputs.
 Application bridges, Dart FFI wrappers and book-source APIs belong in their
@@ -104,13 +105,43 @@ macOS targets require the matching native host CPU: Darwin ARM64 for
 `macos-arm64` and Darwin x86_64 for `macos-x64`, with minimum macOS 13.0.
 Android targets require API 26 or later and build on Linux x86_64. Linux x64 and ARM64 also build on Linux
 x86_64, with the pinned official compiler and Debian Bullseye target sysroot;
-Linux binaries are checked against the GLIBC 2.31 baseline. Linux ARM64 build
-success is separate from native ARM64 execution. Windows uses an installed Visual
+The SDK records its Bullseye sysroot requirement. Static archives alone do not
+establish final GLIBC compatibility; the linked consumer probe is checked
+separately. Linux ARM64 build success is separate from native execution. Windows uses an installed Visual
 Studio toolchain with `DEPOT_TOOLS_WIN_TOOLCHAIN=0`, official clang and a static
 CRT; the CI runner version is not a promise of a minimum Windows version.
 iOS requires a full Xcode installation on Darwin ARM64, produces static SDK
 archives, and disables JIT and WebAssembly. All targets produce static V8 SDKs. Use their recorded libraries, feature
 definitions, C++ runtime dependencies and linker flags when compiling an embedder.
+
+## Link an embedder
+
+Each `v8-static-sdk` target provides `lib/`, `include/` and `linking.json`.
+The monolith and C++ runtime archive names follow the collected GN outputs:
+Unix targets use `.a` archives and Windows uses `.lib`. Linux, Android, macOS
+and Windows include the matching custom libc++/libc++abi runtime archive and
+configuration headers. iOS uses Xcode's system libc++ and does not redistribute
+that system runtime; required compiler runtime archives are recorded separately
+in its SDK library list. Public and generated V8 headers are collected together.
+
+`linking.json` schema version 1 records `includeDirs`, `defines`,
+`compileOptions`, `libraries`, `linkOptions` and `systemLibraries`; target
+metadata also specifies compiler style, C++ runtime or sysroot requirements.
+Paths are relative to the SDK target directory. Compile with all recorded
+feature definitions and matching headers, then link the listed archives and
+system libraries. Use an appropriate pinned compiler plus the required Android
+NDK, Chromium sysroot or Xcode SDK; external sysroots are not copied into the SDK.
+A static archive alone cannot prove final Android 16 KiB ELF alignment.
+
+For iOS minimum version 15.0, use the device or simulator target and its recorded
+clang target separately. Set `v8::V8::SetFlagsFromString("--jitless")` before V8
+initialization. The iOS validation probe compiles and links official V8 APIs;
+it does not execute an iOS runtime or establish device acceptance.
+
+The workflow's SDK probes compile/link a C++ embedder against the supplied SDK.
+Desktop native execution is separate from cross compilation; the Linux ARM64
+runner executes the exact cross-built probe and verifies its associated hashes.
+There are no application bridge exports or custom runtime APIs in these SDKs.
 
 ## Download a released target
 
@@ -157,8 +188,19 @@ inventory and build definitions. Producer inputs and SDK file inventories are
 part of the artifact manifest. A consumer must validate source and producer
 identity, target, minimum OS/API, library sizes and SHA-256.
 
-Current build definitions disable Intl and Temporal and embed startup data in the
-library. These SDKs are not a promise of every V8 optional feature.
+The stable feature profile enables Intl with embedded ICU data and Temporal on
+all ten targets. Android, macOS, Linux and Windows retain JIT and WebAssembly;
+iOS device and simulator remain JITless with WebAssembly disabled to respect
+the platform execution policy. Startup data is embedded, and no separate ICU
+data file is required. The pinned stable V8 runtime defaults apply: Temporal
+is a shipped default feature in the resolved 15.4.80.25 source; the consumer
+probe uses it without adding a harmony flag. This does not enable every
+experimental upstream flag.
+
+The native SDK probe checks Intl NumberFormat and Segmenter, Temporal and,
+on supported targets, a WebAssembly result plus Promise handling. Probe code
+and enabled build switches describe the verification contract; they do not
+claim that a new remote build or target execution has already passed.
 
 Consumers compile against the SDK's matching official V8 C++ headers and feature
 definitions, and link the provided monolith with its recorded standard-library
