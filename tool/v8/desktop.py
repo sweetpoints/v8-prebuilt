@@ -94,7 +94,9 @@ def create_runtime_target(source):
 
     Windows libc++ is an official source_set, rather than a static library.
     complete_static_lib packages its objects and the relevant platform ABI
-    implementation. V8's own v8_monolith archive remains unchanged.
+    implementation. Follow Chromium's public shared_library_deps group because
+    libc++ and common_deps both restrict direct visibility. V8's own
+    v8_monolith archive remains unchanged.
     """
     directory = Path(source) / 'sdk_runtime'
     directory.mkdir(parents=True, exist_ok=True)
@@ -106,7 +108,7 @@ group("sdk") {
 static_library("v8_cxx_runtime") {
   complete_static_lib = true
   output_name = "v8_cxx_runtime"
-  deps = [ "//buildtools/third_party/libc++" ]
+  deps = [ "//build/config:shared_library_deps" ]
   configs -= [ "//build/config/compiler:thin_archive" ]
 }
 ''')
