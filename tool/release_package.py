@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import tarfile
+from sdk_smoke import PROBE
 
 TARGETS = ('android-arm64', 'android-x64', 'ios-arm64', 'ios-simulator-arm64',
            'macos-arm64', 'macos-x64', 'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64')
@@ -64,7 +65,10 @@ def package(inputs, pins_path, output, builder_revision):
                 raise ValueError('unknown or duplicate target')
             if entry.get('artifactKind') != 'v8-static-sdk':
                 raise ValueError('pure V8 static SDK artifact required')
-            verify(manifest_path.parent, entry, 'binary')
+            binary = verify(manifest_path.parent, entry, 'binary')
+            if binary.suffix not in ('.a', '.lib') or binary.read_bytes()[:8] != b'!<arch>\n':
+                raise ValueError('self-contained V8 static archive required')
+            proof_reports = {}
             inventory = entry.get('targetFiles', entry.get('files'))
             if not isinstance(inventory, list) or not inventory:
                 raise ValueError('build target file inventory required')
@@ -75,7 +79,34 @@ def package(inputs, pins_path, output, builder_revision):
                 verify(manifest_path.parent, item)
                 indexed.add(item['path'])
             actual_files = {p.relative_to(manifest_path.parent).as_posix() for p in (manifest_path.parent / target).rglob('*') if p.is_file()}
-            if actual_files - indexed - {target + '/sdk-smoke.json'} or indexed - actual_files:
+            extras = actual_files - indexed
+            allowed_extras = {target + '/sdk-smoke.json'}
+            if target.startswith(('macos-', 'linux-', 'windows-')):
+                report = json.loads(contained(manifest_path.parent, target + '/sdk-smoke.json').read_text())
+                proof_reports[target + '/sdk-smoke.json'] = report
+                probe_name = target + '/' + report['probe']
+                if report['probe'] not in ('validation/sdk-probe', 'validation/sdk-probe.exe'):
+                    raise ValueError('unexpected SDK consumer probe path')
+                verify(manifest_path.parent, {'path': probe_name, 'sha256': report['probeSha256']})
+                allowed_extras.add(probe_name)
+                sidecar_name = probe_name + '.json'
+                if target == 'linux-arm64' and sidecar_name not in actual_files:
+                    raise ValueError('cross-built SDK consumer compile proof required')
+                if sidecar_name in actual_files:
+                    prior = json.loads(contained(manifest_path.parent, sidecar_name).read_text())
+                    proof_reports[sidecar_name] = prior
+                    for key in ('version', 'linkingSha256', 'librarySha256', 'libraries', 'probeSha256', 'probeSourceSha256', 'compiler', 'compileCommand', 'sysroot'):
+                        if prior.get(key) != report.get(key):
+                            raise ValueError('cross-built SDK consumer proof differs')
+                    if (target != 'linux-arm64' or prior.get('status') != 'compiled'
+                            or prior.get('host') != report.get('compileHost')
+                            or prior.get('host', {}).get('os') != 'Linux'
+                            or prior.get('host', {}).get('machine', '').lower() not in ('x86_64', 'amd64')
+                            or prior.get('nativeConsumerExecuted') is not False
+                            or prior.get('cases') != ['official_api_compile', 'official_api_link']):
+                        raise ValueError('invalid cross-built SDK consumer proof')
+                    allowed_extras.add(sidecar_name)
+            if extras - allowed_extras or indexed - actual_files:
                 raise ValueError('unindexed target artifact file')
             if not entry.get('validation', {}).get('built'):
                 raise ValueError('successful native build evidence required')
@@ -95,7 +126,7 @@ def package(inputs, pins_path, output, builder_revision):
                         or smoke.get('runtimeExecuted') is not False
                         or smoke.get('executableInspection', {}).get('platform') != expected_platform):
                     raise ValueError('iOS static SDK link/platform build evidence required')
-            for filename, field in [('args.gn', 'gnArgsSha256'), ('dependencies.txt', 'dependencyInventorySha256'), ('defines.json', 'definesSha256')]:
+            for filename, field in [('args.gn', 'gnArgsSha256'), ('dependencies.txt', 'dependencyInventorySha256'), ('defines.json', 'definesSha256'), ('linking.json', 'linkingSha256')]:
                 if field in entry:
                     verify(manifest_path.parent, {'path': target + '/' + filename, 'sha256': entry[field]})
             if 'header' in entry:
@@ -105,6 +136,37 @@ def package(inputs, pins_path, output, builder_revision):
             if target.startswith(('macos-', 'linux-', 'windows-')):
                 report_path = contained(manifest_path.parent, target + '/sdk-smoke.json')
                 report = json.loads(report_path.read_text())
+                linking = json.loads(contained(manifest_path.parent, target + '/linking.json').read_text())
+                if report.get('linkingSha256') != digest(contained(manifest_path.parent, target + '/linking.json')):
+                    raise ValueError('SDK linking contract evidence differs')
+                libraries = report.get('libraries')
+                if not isinstance(libraries, dict) or set(libraries) != set(linking.get('libraries', [])):
+                    raise ValueError('SDK library set evidence differs')
+                if not linking.get('libraries') or target + '/' + linking['libraries'][0] != entry['binary']:
+                    raise ValueError('SDK primary monolith linking order differs')
+                for relative, checksum in libraries.items():
+                    verify(manifest_path.parent, {'path': target + '/' + relative, 'sha256': checksum})
+                if not report.get('compiler') or report.get('probeSourceSha256') != hashlib.sha256(PROBE.encode()).hexdigest():
+                    raise ValueError('SDK consumer compile evidence missing')
+                command = report.get('compileCommand')
+                if not isinstance(command, list) or not command or any(not isinstance(value, str) for value in command):
+                    raise ValueError('SDK consumer compile command missing')
+                for field in ('defines', 'compileOptions', 'linkOptions', 'systemLibraries'):
+                    if not isinstance(linking.get(field), list) or any(not isinstance(value, str) for value in linking[field]):
+                        raise ValueError('invalid SDK linking options')
+                style = linking.get('compilerStyle', 'clang-cl' if target.startswith('windows-') else 'clang++')
+                options = linking['compileOptions'] + linking['linkOptions']
+                options += [('/D' if style == 'clang-cl' else '-D') + value for value in linking['defines']]
+                options += [value if style == 'clang-cl' else '-l' + value for value in linking['systemLibraries']]
+                if any(value not in command for value in options):
+                    raise ValueError('SDK consumer command differs from linking contract')
+                if entry.get('toolchain', {}).get('clang') and report['compiler'] != entry['toolchain']['clang']:
+                    raise ValueError('SDK consumer compiler differs from pinned toolchain')
+                if target.startswith('linux-'):
+                    sysroot = report.get('sysroot')
+                    arch = 'arm64' if target == 'linux-arm64' else 'amd64'
+                    if not isinstance(sysroot, str) or not sysroot.endswith('debian_bullseye_' + arch + '-sysroot') or '--sysroot=' + sysroot not in command:
+                        raise ValueError('SDK consumer target sysroot evidence missing')
                 os_name = {'macos': 'Darwin', 'linux': 'Linux', 'windows': 'Windows'}[target.split('-')[0]]
                 machine = report.get('host', {}).get('machine', '').lower()
                 expected_machines = ('arm64', 'aarch64') if target.endswith('arm64') else ('x86_64', 'amd64')
@@ -125,7 +187,7 @@ def package(inputs, pins_path, output, builder_revision):
                 raise ValueError('license bundle required')
             for item in entry.get('files', []):
                 verify(manifest_path.parent, item)
-            found[target] = (manifest_path.parent, m, entry)
+            found[target] = (manifest_path.parent, m, entry, actual_files, proof_reports)
     if set(found) != set(TARGETS):
         raise ValueError('complete ten-target build required')
     output.mkdir(parents=True, exist_ok=False)
@@ -133,7 +195,7 @@ def package(inputs, pins_path, output, builder_revision):
     release = dict(provenance, builderRevision=builder_revision, targets={}, licenses={})
     pins_bytes = (json.dumps(pins, indent=2, sort_keys=True) + '\n').encode()
     for target in TARGETS:
-        root, manifest, entry = found[target]
+        root, manifest, entry, expected_files, proof_reports = found[target]
         entry = dict(entry)
         entries = {'pins.json': pins_bytes}
         for p in sorted((root / target).rglob('*')):
@@ -144,6 +206,20 @@ def package(inputs, pins_path, output, builder_revision):
                 entries[name] = contained(root, name).read_bytes()
         for item in manifest['licenses']:
             entries[item['path']] = contained(root, item['path']).read_bytes()
+        if {name for name in entries if name.startswith(target + '/')} != expected_files:
+            raise ValueError('SDK target payload changed during packaging')
+        for item in entry.get('targetFiles', entry.get('files', [])) + manifest['licenses']:
+            data = entries[item['path']]
+            if hashlib.sha256(data).hexdigest() != item['sha256'] or ('size' in item and len(data) != item['size']):
+                raise ValueError('SDK payload changed during packaging')
+        if hashlib.sha256(entries[entry['binary']]).hexdigest() != entry['sha256']:
+            raise ValueError('SDK primary monolith changed during packaging')
+        for name, report in proof_reports.items():
+            if json.loads(entries[name]) != report:
+                raise ValueError('SDK consumer proof changed during packaging')
+            probe_key = target + '/' + report.get('probe', 'validation/sdk-probe')
+            if hashlib.sha256(entries[probe_key]).hexdigest() != report['probeSha256']:
+                raise ValueError('SDK consumer executable changed during packaging')
         entry['files'] = [{'path': name, 'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)} for name, data in sorted(entries.items()) if name.startswith(target + '/')]
         entry['targetFiles'] = entry['files']
         single = dict(provenance, targets={target: entry}, licenses=manifest['licenses'])

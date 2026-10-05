@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from release_package import TARGETS, package
+from sdk_smoke import PROBE
 from release_publish import publish
 
 class FakeGitHub:
@@ -48,20 +49,33 @@ class ReleaseTests(unittest.TestCase):
             out = root / target / 'include'
             out.mkdir(parents=True)
             (out / 'v8.h').write_text('header')
-            binary = root / target / 'library'
-            binary.write_bytes(target.encode())
+            binary = root / target / 'lib' / ('v8_monolith.lib' if target.startswith('windows-') else 'libv8_monolith.a')
+            binary.parent.mkdir()
+            binary.write_bytes(b'!<arch>\n' + target.encode())
             license = root / 'licenses' / 'LICENSE'
             license.parent.mkdir()
             license.write_text('official license')
             manifest = {key: self.pins[key] for key in ('schemaVersion', 'v8', 'depotTools')}
-            manifest.update(targets={target: {'binary': f'{target}/library', 'size': binary.stat().st_size, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}}, licenses=[{'path': 'licenses/LICENSE', 'sha256': hashlib.sha256(license.read_bytes()).hexdigest()}])
+            manifest.update(targets={target: {'binary': binary.relative_to(root).as_posix(), 'size': binary.stat().st_size, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}}, licenses=[{'path': 'licenses/LICENSE', 'sha256': hashlib.sha256(license.read_bytes()).hexdigest()}])
+            linking_path = root / target / 'linking.json'
+            linking_path.write_text(json.dumps({'schemaVersion': 1, 'libraries': [binary.relative_to(root / target).as_posix()], 'defines': [], 'compileOptions': [], 'linkOptions': [], 'systemLibraries': []}))
             if target.startswith(('macos-', 'linux-', 'windows-')):
+                probe = root / target / 'validation' / ('sdk-probe.exe' if target.startswith('windows-') else 'sdk-probe')
+                probe.parent.mkdir(); probe.write_bytes(b'compiled-official-api-consumer')
+                sysroot = ('/official/debian_bullseye_' + ('arm64' if target == 'linux-arm64' else 'amd64') + '-sysroot') if target.startswith('linux-') else None
+                command = ['official-compiler', 'consumer.cpp'] + (['--sysroot=' + sysroot] if sysroot else [])
                 os_name = {'macos': 'Darwin', 'linux': 'Linux', 'windows': 'Windows'}[target.split('-')[0]]
-                (root / target / 'sdk-smoke.json').write_text(json.dumps({'schemaVersion': 1, 'status': 'passed', 'version': self.pins['v8']['version'], 'librarySha256': manifest['targets'][target]['sha256'], 'host': {'os': os_name, 'machine': 'arm64' if target.endswith('arm64') else 'x86_64'}, 'scope': 'official V8 API SDK consumer', 'nativeConsumerExecuted': True, 'cases': ['official_api_compile', 'official_api_link', 'official_api_execute']}))
+                (root / target / 'sdk-smoke.json').write_text(json.dumps({'schemaVersion': 1, 'status': 'passed', 'version': self.pins['v8']['version'], 'librarySha256': manifest['targets'][target]['sha256'], 'linkingSha256': hashlib.sha256(linking_path.read_bytes()).hexdigest(), 'libraries': {binary.relative_to(root / target).as_posix(): hashlib.sha256(binary.read_bytes()).hexdigest()}, 'probe': probe.relative_to(root / target).as_posix(), 'probeSha256': hashlib.sha256(probe.read_bytes()).hexdigest(), 'probeSourceSha256': hashlib.sha256(PROBE.encode()).hexdigest(), 'compiler': 'fixed official clang fixture', 'compileCommand': command, 'sysroot': sysroot, 'host': {'os': os_name, 'machine': 'arm64' if target.endswith('arm64') else 'x86_64'}, 'scope': 'official V8 API SDK consumer', 'nativeConsumerExecuted': True, 'cases': ['official_api_compile', 'official_api_link', 'official_api_execute']}))
+            if target == 'linux-arm64':
+                path = root / target / 'sdk-smoke.json'
+                report = json.loads(path.read_text())
+                report['compileHost'] = {'os': 'Linux', 'machine': 'x86_64'}
+                path.write_text(json.dumps(report))
+                prior = dict(report, status='compiled', nativeConsumerExecuted=False, cases=['official_api_compile', 'official_api_link'], host=report['compileHost'])
+                (root / target / 'validation/sdk-probe.json').write_text(json.dumps(prior))
             entry = manifest['targets'][target]
             entry['artifactKind'] = 'v8-static-sdk'
             entry['validation'] = {'built': True, 'runtimeTested': False}
-            (root / target / 'linking.json').write_text('{}')
             entry['targetFiles'] = [{'path': p.relative_to(root).as_posix(), 'size': p.stat().st_size, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in (root / target).rglob('*') if p.is_file() and p.name != 'sdk-smoke.json']
             if target.startswith('android-'):
                 entry['validation']['linkTested'] = True
@@ -86,7 +100,7 @@ class ReleaseTests(unittest.TestCase):
             self.package()
         self.assertFalse((self.root / 'dist').exists())
     def test_corrupt_binary_rejected(self):
-        (self.inputs / TARGETS[0] / TARGETS[0] / 'library').write_bytes(b'changed')
+        (self.inputs / TARGETS[0] / TARGETS[0] / 'lib/libv8_monolith.a').write_bytes(b'changed')
         with self.assertRaisesRegex(ValueError, 'hash or size'):
             self.package()
     def test_mixed_provenance_rejected(self):
@@ -150,6 +164,43 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'identity'):
             publish(self.root / 'dist', 'example/test', '', gh)
         self.assertEqual([], gh.mutations)
+    def test_cross_compile_proof_required(self):
+        path = self.inputs / 'linux-arm64/linux-arm64/validation/sdk-probe.json'
+        path.unlink()
+        self.change_manifest('linux-arm64', lambda e: e.update(targetFiles=[v for v in e['targetFiles'] if v['path'] != 'linux-arm64/validation/sdk-probe.json']))
+        with self.assertRaisesRegex(ValueError, 'compile proof required'):
+            self.package()
+    def test_native_probe_hash_mismatch_rejected(self):
+        path = self.inputs / 'linux-x64/linux-x64/sdk-smoke.json'
+        report = json.loads(path.read_text()); report['probeSha256'] = '0' * 64
+        path.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, 'hash or size'):
+            self.package()
+    def test_linking_proof_hash_mismatch_rejected(self):
+        path = self.inputs / 'linux-x64/linux-x64/sdk-smoke.json'
+        report = json.loads(path.read_text()); report['linkingSha256'] = '0' * 64
+        path.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, 'linking contract evidence'):
+            self.package()
+    def test_thin_archive_is_not_self_contained_sdk(self):
+        target = 'android-arm64'
+        path = self.inputs / target / target / 'lib/libv8_monolith.a'
+        path.write_bytes(b'!<thin>\nexternal-object')
+        checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        def change(entry):
+            entry.update(sha256=checksum, size=path.stat().st_size)
+            for item in entry['targetFiles']:
+                if item['path'] == target + '/lib/libv8_monolith.a':
+                    item.update(sha256=checksum, size=path.stat().st_size)
+        self.change_manifest(target, change)
+        with self.assertRaisesRegex(ValueError, 'self-contained'):
+            self.package()
+    def test_different_consumer_source_proof_rejected(self):
+        path = self.inputs / 'linux-x64/linux-x64/sdk-smoke.json'
+        report = json.loads(path.read_text()); report['probeSourceSha256'] = '0' * 64
+        path.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, 'compile evidence'):
+            self.package()
     def test_project_bridge_manifest_rejected(self):
         path = self.inputs / TARGETS[0] / 'manifest.json'
         manifest = json.loads(path.read_text()); manifest['bridge'] = {'abi': 1}

@@ -90,10 +90,44 @@ jobs:
           sudo "$source_root" --no-prompt
       - name: Build the native SDK
         run: python tool/v8/build.py build --target '${{ matrix.target }}' --pins-file stable-pins.json --cache-root "$V8_CACHE_ROOT" --output-root artifacts --jobs '${{ matrix.jobs }}'
+      - name: Select the fixed official consumer compiler
+        if: startsWith(matrix.target, 'macos-') || startsWith(matrix.target, 'linux-') || startsWith(matrix.target, 'windows-')
+        run: |
+          python - <<'PYTHON'
+          import os, pathlib, subprocess
+          name = 'clang-cl.exe' if os.name == 'nt' else 'clang++'
+          paths = list(pathlib.Path(os.environ['V8_CACHE_ROOT']).rglob('third_party/llvm-build/Release+Asserts/bin/' + name))
+          if len(paths) != 1:
+              raise ValueError('Exactly one fixed official Clang consumer compiler required')
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('V8_SDK_COMPILER=' + str(paths[0].resolve()) + '\n')
+              stream.write('V8_SDK_PROBE_SUFFIX=' + ('.exe' if os.name == 'nt' else '') + '\n')
+              target = '${{ matrix.target }}'
+              if target.startswith('linux-'):
+                  arch = 'arm64' if target == 'linux-arm64' else 'amd64'
+                  sysroot = paths[0].parents[4] / ('third_party/debian_bullseye_' + arch + '-sysroot')
+                  if not sysroot.is_dir():
+                      raise ValueError('Fixed official Chromium Linux sysroot missing')
+                  stream.write('V8_SDK_SYSROOT=' + str(sysroot.resolve()) + '\n')
+              elif target.startswith('macos-'):
+                  sysroot = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip()
+                  stream.write('V8_SDK_SYSROOT=' + sysroot + '\n')
+          PYTHON
+      - name: Cross-compile and link the ARM64 official V8 API consumer
+        if: matrix.target == 'linux-arm64'
+        run: python tool/sdk_smoke.py --sdk-root 'artifacts/${{ needs.detect.outputs.revision }}/linux-arm64' --expected-version '${{ needs.detect.outputs.version }}' --compiler "$V8_SDK_COMPILER" --sysroot "$V8_SDK_SYSROOT" --compile-only --probe-output smoke-probes/linux-arm64/sdk-probe --output smoke-probes/linux-arm64/sdk-probe.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.target == 'linux-arm64'
+        with:
+          name: smoke-probe-linux-arm64
+          path: smoke-probes/linux-arm64/
+          if-no-files-found: error
       - name: Compile, link and execute an official V8 API SDK consumer
         if: startsWith(matrix.target, 'macos-') || matrix.target == 'linux-x64' || startsWith(matrix.target, 'windows-')
         run: |
-          python tool/sdk_smoke.py --sdk-root 'artifacts/${{ needs.detect.outputs.revision }}/${{ matrix.target }}' --expected-version '${{ needs.detect.outputs.version }}' --output 'artifacts/${{ needs.detect.outputs.revision }}/${{ matrix.target }}/sdk-smoke.json'
+          task_sdk_sysroot_args=()
+          if [[ -n "${V8_SDK_SYSROOT:-}" ]]; then task_sdk_sysroot_args=(--sysroot "$V8_SDK_SYSROOT"); fi
+          python tool/sdk_smoke.py "${task_sdk_sysroot_args[@]}" --sdk-root 'artifacts/${{ needs.detect.outputs.revision }}/${{ matrix.target }}' --expected-version '${{ needs.detect.outputs.version }}' --compiler "$V8_SDK_COMPILER" --probe-output "artifacts/${{ needs.detect.outputs.revision }}/${{ matrix.target }}/validation/sdk-probe${V8_SDK_PROBE_SUFFIX:-}" --output 'artifacts/${{ needs.detect.outputs.revision }}/${{ matrix.target }}/sdk-smoke.json'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: v8-${{ matrix.target }}
@@ -110,12 +144,21 @@ jobs:
         with:
           name: v8-linux-arm64
           path: artifacts/${{ needs.detect.outputs.revision }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: smoke-probe-linux-arm64
+          path: artifacts/${{ needs.detect.outputs.revision }}/linux-arm64/validation
       - name: Compile, link and execute an ARM64 official V8 API SDK consumer
-        run: python3 tool/sdk_smoke.py --sdk-root 'artifacts/${{ needs.detect.outputs.revision }}/linux-arm64' --expected-version '${{ needs.detect.outputs.version }}' --output sdk-smoke.json
+        run: |
+          chmod +x 'artifacts/${{ needs.detect.outputs.revision }}/linux-arm64/validation/sdk-probe'
+          python3 tool/sdk_smoke.py --sdk-root 'artifacts/${{ needs.detect.outputs.revision }}/linux-arm64' --expected-version '${{ needs.detect.outputs.version }}' --execute-only --probe-path 'artifacts/${{ needs.detect.outputs.revision }}/linux-arm64/validation/sdk-probe' --output 'artifacts/${{ needs.detect.outputs.revision }}/linux-arm64/sdk-smoke.json'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-arm-runtime
-          path: sdk-smoke.json
+          path: |
+            artifacts/${{ needs.detect.outputs.revision }}/linux-arm64/sdk-smoke.json
+            artifacts/${{ needs.detect.outputs.revision }}/linux-arm64/validation/sdk-probe
+            artifacts/${{ needs.detect.outputs.revision }}/linux-arm64/validation/sdk-probe.json
           if-no-files-found: error
   publish:
     needs: [detect, build, linux-arm-runtime]
@@ -139,6 +182,8 @@ jobs:
       - name: Assemble complete deterministic release
         run: |
           cp arm-runtime/sdk-smoke.json inputs/v8-linux-arm64/linux-arm64/sdk-smoke.json
+          mkdir -p inputs/v8-linux-arm64/linux-arm64/validation
+          cp arm-runtime/validation/sdk-probe* inputs/v8-linux-arm64/linux-arm64/validation/
           python3 -m unittest discover -s tests -p 'test_*.py'
           python3 -m unittest discover -s tool -p 'test_*.py'
           python3 -m unittest discover -s tool/v8 -p 'test_*.py'
