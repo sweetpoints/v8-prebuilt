@@ -178,7 +178,28 @@ def output_for(source, out, depot, env, label):
     return archives[0]
 
 
-def link_contract(target, pins, defines, frameworks=(), system_libraries=()):
+def collect_link_libraries(source, libraries):
+    """GN // paths are pinned source archives; plain names are system libraries."""
+    archives, system = {}, []
+    for value in libraries:
+        if not isinstance(value, str):
+            raise ValueError('GN library must be a string')
+        if value.startswith('//'):
+            archive = (source / value[2:]).resolve()
+            if not archive.is_relative_to(source.resolve()) or not archive.is_file() or archive.suffix != '.a':
+                raise ValueError('GN source library must be an existing pinned static archive: ' + value)
+            relative = 'lib/' + archive.name
+            if archive.name == 'libv8_monolith.a' or (relative in archives and archives[relative] != archive):
+                raise ValueError('SDK library filename collision: ' + relative)
+            archives[relative] = archive
+        elif re.fullmatch(r'[A-Za-z0-9_+][A-Za-z0-9_+.-]*', value) and not value.endswith(('.a', '.dylib', '.tbd')):
+            system.append(value)
+        else:
+            raise ValueError('Unsupported non-system GN library path: ' + value)
+    return archives, list(dict.fromkeys(system))
+
+
+def link_contract(target, pins, defines, frameworks=(), system_libraries=(), archives=()):
     config = configuration(target, pins)
     return {
         'schemaVersion': 1, 'kind': 'ios-static-sdk', 'target': target, 'architecture': 'arm64',
@@ -186,7 +207,7 @@ def link_contract(target, pins, defines, frameworks=(), system_libraries=()):
         'clangTarget': 'arm64-apple-ios' + config['minIOS'] + ('-simulator' if target.endswith('simulator-arm64') else ''),
         'nativeV8Archive': 'lib/libv8_monolith.a',
         'includeDirs': ['include'], 'defines': defines, 'compileOptions': ['-std=c++20'],
-        'libraries': ['lib/libv8_monolith.a'],
+        'libraries': ['lib/libv8_monolith.a', *archives],
         'linkOptions': [arg for name in frameworks for arg in ('-framework', name.removesuffix('.framework'))],
         'systemLibraries': list(dict.fromkeys(['c++', *system_libraries])),
         'cxxStandard': 'c++20', 'stdlib': 'Xcode SDK libc++ (system; not bundled)',
@@ -242,7 +263,8 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
     monolith = output_for(source, out, depot, env, '//:v8_monolith')
     defines = common.sdk_defines(source, out, depot, env, root_target='//:v8_monolith')
     frameworks = common.gn_property(source, out, depot, env, '//:v8_monolith', 'frameworks', root_target='//:v8_monolith')
-    system_libraries = common.gn_property(source, out, depot, env, '//:v8_monolith', 'libs', root_target='//:v8_monolith')
+    gn_libraries = common.gn_property(source, out, depot, env, '//:v8_monolith', 'libs', root_target='//:v8_monolith')
+    archives, system_libraries = collect_link_libraries(source, gn_libraries)
     with tempfile.TemporaryDirectory(prefix='v8-ios-sdk-') as staging:
         directory = Path(staging)
         files = common.sdk_headers(source, out)
@@ -252,13 +274,15 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
             shutil.copyfile(original, destination)
         (directory / 'lib').mkdir()
         shutil.copyfile(monolith, directory / 'lib/libv8_monolith.a')
+        for relative, original in archives.items():
+            shutil.copyfile(original, directory / relative)
         inspection = validate_binary(directory / 'lib/libv8_monolith.a', source, target, env)
         for minimum in inspection['objectMinIOS']:
             expected = tuple(map(int, pins['targets'][target]['minIOS'].split('.')))
             expected = expected + (0,) * (3 - len(expected))
             if tuple(map(int, minimum.split('.'))) > expected:
                 raise ValueError('An archive member requires newer iOS than the SDK deployment contract')
-        (directory / 'linking.json').write_text(json.dumps(link_contract(target, pins, defines, frameworks, system_libraries), indent=2) + '\n')
+        (directory / 'linking.json').write_text(json.dumps(link_contract(target, pins, defines, frameworks, system_libraries, archives), indent=2) + '\n')
         smoke = link_smoke(directory, source, target, pins, env)
         (directory / 'args.gn').write_text(args)
         (directory / 'defines.json').write_text(json.dumps(defines, indent=2) + '\n')

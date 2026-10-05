@@ -164,6 +164,9 @@ class IOSContractTest(unittest.TestCase):
             out.mkdir(parents=True)
             archive = out / 'libv8_monolith.a'
             archive.write_bytes(archive_bytes(object_bytes()))
+            runtime = source / 'third_party/llvm/libclang_rt.ios.a'
+            runtime.parent.mkdir(parents=True)
+            runtime.write_bytes(archive_bytes(object_bytes()))
             pins = copy.deepcopy(PINS)
             pins['v8'] = {'version': '15.4.80.25'}
             expected_args = ios.gn_arguments('ios-arm64', pins)
@@ -174,7 +177,11 @@ class IOSContractTest(unittest.TestCase):
             def publish(src, target, actual_pins, files, entry, output_root):
                 self.assertEqual(target, 'ios-arm64')
                 self.assertEqual(set(files), {'include/v8.h', 'lib/libv8_monolith.a',
-                    'linking.json', 'args.gn', 'defines.json', 'dependencies.txt'})
+                    'linking.json', 'args.gn', 'defines.json', 'dependencies.txt', 'lib/libclang_rt.ios.a'})
+                self.assertEqual(files['lib/libclang_rt.ios.a'].read_bytes(), runtime.read_bytes())
+                linking = json.loads(files['linking.json'].read_text())
+                self.assertIn('lib/libclang_rt.ios.a', linking['libraries'])
+                self.assertNotIn('//third_party/llvm/libclang_rt.ios.a', linking['systemLibraries'])
                 self.assertEqual(files['args.gn'].read_text(), expected_args)
                 self.assertRegex(entry['platformBuildInputSha256'], r'^[0-9a-f]{64}$')
                 self.assertFalse(entry['validation']['runtimeTested'])
@@ -182,7 +189,7 @@ class IOSContractTest(unittest.TestCase):
             with patch('ios.require_host'), patch('ios.common.source_version', return_value='15.4.80.25'), \
                  patch('ios.common.run', side_effect=run), patch('ios.output_for', return_value=archive), \
                  patch('ios.common.sdk_defines', return_value=['V8_TARGET_OS_IOS']) as defines, \
-                 patch('ios.common.gn_property', return_value=[]), \
+                 patch('ios.common.gn_property', side_effect=[[], ['//third_party/llvm/libclang_rt.ios.a']]), \
                  patch('ios.common.sdk_headers', return_value={'include/v8.h': header}), \
                  patch('ios.link_smoke', return_value={'passed': True, 'runtimeExecuted': False}), \
                  patch('ios.common.publish_sdk', side_effect=publish):
@@ -190,6 +197,21 @@ class IOSContractTest(unittest.TestCase):
                 self.assertEqual(defines.call_args.kwargs['root_target'], '//:v8_monolith')
             self.assertTrue(any(command[-1] == 'v8_monolith' for command in commands))
             self.assertFalse(any('source_v8:source_v8' in arg for command in commands for arg in command))
+
+    def test_gn_source_archives_are_bundled_and_never_become_l_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            runtime = source / 'third_party/llvm/libclang_rt.iossim.a'
+            runtime.parent.mkdir(parents=True)
+            runtime.write_bytes(b'archive')
+            archives, system = ios.collect_link_libraries(source, ['c++', '//third_party/llvm/libclang_rt.iossim.a', 'objc', 'c++'])
+            self.assertEqual(archives, {'lib/libclang_rt.iossim.a': runtime.resolve()})
+            self.assertEqual(system, ['c++', 'objc'])
+            contract = ios.link_contract('ios-simulator-arm64', PINS, [], system_libraries=system, archives=archives)
+            self.assertEqual(contract['libraries'], ['lib/libv8_monolith.a', 'lib/libclang_rt.iossim.a'])
+            self.assertFalse(any(value.startswith('//') for value in contract['systemLibraries']))
+            for bad in ['//missing.a', '//../outside.a', '/usr/lib/untracked.a', '-lobjc', 'libthing.a']:
+                with self.assertRaises(ValueError): ios.collect_link_libraries(source, [bad])
 
     def test_inventory_indexes_every_file_by_content(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -217,6 +239,40 @@ class AppleSDKObjectTest(unittest.TestCase):
                 subprocess.run(['xcrun', 'clang', '-target', triple, '-isysroot', sdk, '-c', str(source), '-o', str(obj)], check=True)
                 subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), str(obj)], check=True)
                 self.assertEqual(ios.inspect_static_archive(archive, target)['platform'], ios.PLATFORMS[target])
+
+    def test_real_apple_link_resolves_gn_source_archive_dependency(self):
+        # Real Apple SDK linking proves archive-path handling, not V8 execution.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for target in ios.TARGETS:
+                source = root / target / 'source'
+                source.mkdir(parents=True)
+                sdk_dir = root / target / 'sdk'
+                (sdk_dir / 'lib').mkdir(parents=True)
+                (sdk_dir / 'include').mkdir()
+                contract = ios.link_contract(target, PINS, [])
+                apple_sdk = subprocess.check_output(['xcrun', '--sdk', ios.SDKS[target], '--show-sdk-path'], text=True).strip()
+                runtime = source / 'third_party/llvm/libclang_rt.test.a'
+                runtime.parent.mkdir(parents=True)
+                for name, code, archive in [('runtime', 'int dependency(){return 42;}', runtime),
+                    ('monolith', 'int dependency(); int monolith(){return dependency();}', sdk_dir / 'lib/libv8_monolith.a')]:
+                    cc = source / (name + '.cpp')
+                    cc.write_text(code)
+                    obj = source / (name + '.o')
+                    subprocess.run(['xcrun', 'clang++', '-target', contract['clangTarget'], '-isysroot', apple_sdk,
+                        '-c', str(cc), '-o', str(obj)], check=True)
+                    subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), str(obj)], check=True)
+                archives, system = ios.collect_link_libraries(source, ['//third_party/llvm/libclang_rt.test.a'])
+                for relative, archive in archives.items(): shutil.copyfile(archive, sdk_dir / relative)
+                contract = ios.link_contract(target, PINS, [], system_libraries=system, archives=archives)
+                (sdk_dir / 'linking.json').write_text(json.dumps(contract))
+                with patch('ios.LINK_SMOKE', 'int monolith(); int main(){return monolith()==42?0:1;}'):
+                    proof = ios.link_smoke(sdk_dir, source, target, PINS, dict(os.environ))
+                self.assertTrue(proof['passed'])
+                self.assertFalse(proof['runtimeExecuted'])
+                self.assertEqual(proof['executableInspection']['platform'], ios.PLATFORMS[target])
+                self.assertIn(str(sdk_dir / 'lib/libclang_rt.test.a'), proof['command'])
+                self.assertFalse(any(arg.startswith('-l//') for arg in proof['command']))
 
 
 
