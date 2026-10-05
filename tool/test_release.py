@@ -58,7 +58,15 @@ class ReleaseTests(unittest.TestCase):
             manifest = {key: self.pins[key] for key in ('schemaVersion', 'v8', 'depotTools')}
             manifest.update(targets={target: {'binary': binary.relative_to(root).as_posix(), 'size': binary.stat().st_size, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}}, licenses=[{'path': 'licenses/LICENSE', 'sha256': hashlib.sha256(license.read_bytes()).hexdigest()}])
             linking_path = root / target / 'linking.json'
-            linking_path.write_text(json.dumps({'schemaVersion': 1, 'libraries': [binary.relative_to(root / target).as_posix()], 'defines': [], 'compileOptions': [], 'linkOptions': [], 'systemLibraries': []}))
+            feature_profile = {'internationalization': True, 'temporal': True, 'icuData': 'embedded',
+                               'jit': False if target.startswith('ios-') else 'upstream-default',
+                               'webAssembly': False if target.startswith('ios-') else 'upstream-default',
+                               'experimentalRuntimeFlags': []}
+            linking_path.write_text(json.dumps({'schemaVersion': 1, 'libraries': [binary.relative_to(root / target).as_posix()], 'defines': [], 'compileOptions': [], 'linkOptions': [], 'systemLibraries': [], 'featureProfile': feature_profile}))
+            args = 'v8_enable_i18n_support = true\nv8_enable_temporal_support = true\nicu_use_data_file = false\n'
+            if target.startswith('ios-'):
+                args += 'v8_jitless = true\nv8_enable_webassembly = false\n'
+            (root / target / 'args.gn').write_text(args)
             if target.startswith(('macos-', 'linux-', 'windows-')):
                 probe = root / target / 'validation' / ('sdk-probe.exe' if target.startswith('windows-') else 'sdk-probe')
                 probe.parent.mkdir(); probe.write_bytes(b'compiled-official-api-consumer')
@@ -118,6 +126,59 @@ class ReleaseTests(unittest.TestCase):
         manifest = json.loads(path.read_text())
         change(manifest['targets'][target])
         path.write_text(json.dumps(manifest))
+    def reindex_file(self, target, path):
+        checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        def change(entry):
+            for item in entry['targetFiles']:
+                if item['path'] == target + '/' + path.name:
+                    item.update(sha256=checksum, size=path.stat().st_size)
+            field = {'args.gn': 'gnArgsSha256', 'linking.json': 'linkingSha256'}[path.name]
+            entry[field] = checksum
+        self.change_manifest(target, change)
+    def test_minimal_sdk_profile_rejected(self):
+        target = 'android-arm64'
+        path = self.inputs / target / target / 'linking.json'
+        linking = json.loads(path.read_text()); linking['featureProfile']['internationalization'] = False
+        path.write_text(json.dumps(linking)); self.reindex_file(target, path)
+        with self.assertRaisesRegex(ValueError, 'feature profile'):
+            self.package()
+    def test_disabled_gn_features_rejected_even_with_full_profile(self):
+        target = 'android-arm64'
+        path = self.inputs / target / target / 'args.gn'
+        original = path.read_text()
+        for flag, old, new in [('v8_enable_i18n_support', 'true', 'false'),
+                               ('v8_enable_temporal_support', 'true', 'false'),
+                               ('icu_use_data_file', 'false', 'true')]:
+            with self.subTest(flag=flag):
+                path.write_text(original.replace(flag + ' = ' + old, flag + ' = ' + new))
+                self.reindex_file(target, path)
+                with self.assertRaisesRegex(ValueError, 'GN feature configuration'):
+                    self.package()
+    def test_commented_or_duplicate_gn_feature_is_not_evidence(self):
+        target = 'android-arm64'
+        path = self.inputs / target / target / 'args.gn'; original = path.read_text()
+        for args in [original.replace('v8_enable_temporal_support = true', '# v8_enable_temporal_support = true'),
+                     original + 'v8_enable_temporal_support = false\n']:
+            with self.subTest(args=args):
+                path.write_text(args); self.reindex_file(target, path)
+                with self.assertRaisesRegex(ValueError, 'GN feature configuration'):
+                    self.package()
+    def test_ios_profile_cannot_claim_jit_or_webassembly(self):
+        target = 'ios-arm64'
+        path = self.inputs / target / target / 'linking.json'; original = path.read_text()
+        for field in ('jit', 'webAssembly'):
+            with self.subTest(field=field):
+                linking = json.loads(original); linking['featureProfile'][field] = 'upstream-default'
+                path.write_text(json.dumps(linking)); self.reindex_file(target, path)
+                with self.assertRaisesRegex(ValueError, 'feature profile'):
+                    self.package()
+    def test_ios_gn_jitless_contract_required(self):
+        target = 'ios-simulator-arm64'
+        path = self.inputs / target / target / 'args.gn'
+        path.write_text(path.read_text().replace('v8_jitless = true', 'v8_jitless = false'))
+        self.reindex_file(target, path)
+        with self.assertRaisesRegex(ValueError, 'GN feature configuration'):
+            self.package()
     def test_header_tamper_rejected_by_inventory(self):
         (self.inputs / TARGETS[0] / TARGETS[0] / 'include' / 'v8.h').write_text('modified')
         with self.assertRaisesRegex(ValueError, 'hash or size'):

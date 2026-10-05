@@ -31,6 +31,26 @@ def verify(root, item, key='path'):
         raise ValueError('artifact hash or size mismatch')
     return p
 
+def verify_feature_profile(root, target):
+    linking = json.loads(contained(root, target + '/linking.json').read_text())
+    ios = target.startswith('ios-')
+    expected = {'internationalization': True, 'temporal': True, 'icuData': 'embedded',
+                'jit': False if ios else 'upstream-default',
+                'webAssembly': False if ios else 'upstream-default',
+                'experimentalRuntimeFlags': []}
+    profile = linking.get('featureProfile')
+    if (profile != expected or any(type(profile[key]) is not type(value) for key, value in expected.items())):
+        raise ValueError('full SDK feature profile required')
+    args = contained(root, target + '/args.gn').read_text()
+    flags = {'v8_enable_i18n_support': True, 'v8_enable_temporal_support': True,
+             'icu_use_data_file': False}
+    if ios:
+        flags.update(v8_jitless=True, v8_enable_webassembly=False)
+    for flag, value in flags.items():
+        assignments = re.findall(r'^\s*' + re.escape(flag) + r'\s*=\s*(.*?)\s*$', args, re.MULTILINE)
+        if assignments != ['true' if value else 'false']:
+            raise ValueError('full SDK GN feature configuration required')
+
 def archive(path, entries):
     with path.open('xb') as raw:
         with gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=0) as gz:
@@ -133,6 +153,7 @@ def package(inputs, pins_path, output, builder_revision):
                 verify(manifest_path.parent, {'path': entry['header'], 'sha256': entry['headerSha256']})
             for item in entry.get('platformBuildInputs', []):
                 verify(manifest_path.parent, item)
+            verify_feature_profile(manifest_path.parent, target)
             if target.startswith(('macos-', 'linux-', 'windows-')):
                 report_path = contained(manifest_path.parent, target + '/sdk-smoke.json')
                 report = json.loads(report_path.read_text())
