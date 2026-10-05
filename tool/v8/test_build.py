@@ -185,6 +185,30 @@ class BuildContractTests(unittest.TestCase):
             self.assertEqual(profile['linking']['linkOptions'][-6:],
                              ['-framework','Foundation','-framework','CoreFoundation','-framework','Security'])
 
+    def test_android_profile_matches_official_custom_unwind_driver_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory); out = source / 'out/sdk'
+            vendor = source / 'buildtools/third_party/libc++'; vendor.mkdir(parents=True)
+            (vendor / '__config_site').write_text('ABI config')
+            (vendor / '__assertion_handler').write_text('vendor assertion handler')
+            builtin = source / 'third_party/llvm-build/Release+Asserts/lib/clang/24/lib/linux/libclang_rt.builtins-aarch64-android.a'
+            builtin.parent.mkdir(parents=True); builtin.write_text('fixed compiler runtime')
+            monolith = source / 'libv8_monolith.a'; monolith.write_text('archive')
+            runtime = source / 'libv8_cxx_runtime.a'; runtime.write_text('complete upstream libc++/abi/unwind')
+            for official_flags in (['--unwindlib=none', '--sysroot=/build/cache', '-Werror'], []):
+                with patch.object(builder, 'gn_output', side_effect=[monolith, runtime]), \
+                     patch.object(builder, 'inspect_apple_android_archive'), \
+                     patch.object(builder, 'gn_property', return_value=official_flags) as property:
+                    if not official_flags:
+                        with self.assertRaisesRegex(ValueError, 'disable toolchain unwind'):
+                            builder.apple_android_profile(source, out, 'android-arm64', builder.read_pins(), [], Path('/depot'), {})
+                        continue
+                    profile = builder.apple_android_profile(source, out, 'android-arm64', builder.read_pins(), [], Path('/depot'), {})
+                    self.assertIn('--unwindlib=none', profile['linking']['linkOptions'])
+                    self.assertNotIn('--sysroot=/build/cache', profile['linking']['linkOptions'])
+                    self.assertEqual(list(profile['libraries']), ['lib/libv8_monolith.a', 'lib/libv8_cxx_runtime.a', 'lib/' + builtin.name])
+                    self.assertEqual(property.call_args.args[-1], 'ldflags')
+
     def test_sdk_abi_options_keep_actual_relative_vtable_flag(self):
         with patch.object(builder, 'gn_property', return_value=['-std=c++20', '-fexperimental-relative-c++-abi-vtables', '--sysroot=/private/cache']):
             self.assertEqual(builder.sdk_abi_options(Path('/v8'), Path('/out'), Path('/depot'), {}),
@@ -199,7 +223,7 @@ class BuildContractTests(unittest.TestCase):
             monolith = sdk / 'lib/libv8_monolith.a'; monolith.write_bytes(b'static SDK archive')
             contract = {'schemaVersion':1, 'includeDirs':['include'], 'defines':['V8_ENABLE_SANDBOX'],
                         'compileOptions':['-std=c++20', '--target=aarch64-linux-android26'],
-                        'libraries':['lib/libv8_monolith.a'], 'linkOptions':['-nostdlib++', '-Wl,-z,max-page-size=16384'],
+                        'libraries':['lib/libv8_monolith.a'], 'linkOptions':['-nostdlib++', '-Wl,-z,max-page-size=16384', '--unwindlib=none'],
                         'systemLibraries':['dl', 'm'], 'sysrootRequirement':{'kind':'android-ndk'}}
             (sdk / 'linking.json').write_text(json.dumps(contract))
             def linked_elf(machine=183, alignment=16384):
@@ -222,6 +246,7 @@ class BuildContractTests(unittest.TestCase):
             self.assertEqual(report['linkingSha256'], builder.sha(sdk / 'linking.json'))
             self.assertEqual(len(files), 3)
             self.assertIn('-Wl,--no-undefined', calls[0])
+            self.assertIn('--unwindlib=none', calls[0])
             self.assertIn('--sysroot=' + str(sysroot), calls[0])
             self.assertNotIn('source_v8', (sdk / 'validation/android-sdk-link.cc').read_text())
             binary = sdk / 'validation/libv8_sdk_link_test.so'

@@ -527,7 +527,13 @@ def apple_android_profile(source, out, target, pins, defines, depot, env):
     else:
         triple = ('aarch64' if target == 'android-arm64' else 'x86_64') + '-linux-android26'
         options += ['--target=' + triple]
-        link += ['--target=' + triple, '-Wl,-z,max-page-size=16384']
+        # Chromium builds its own libunwind through libc++abi. The complete
+        # runtime archive includes those objects; match the official driver
+        # flag instead of accidentally selecting an unrelated NDK unwind lib.
+        official_ldflags = gn_property(source, out, depot, env, '//:v8_monolith', 'ldflags')
+        if '--unwindlib=none' not in official_ldflags:
+            raise ValueError('Pinned Android custom runtime must disable toolchain unwind library')
+        link += ['--target=' + triple, '-Wl,-z,max-page-size=16384', '--unwindlib=none']
         systems = ['dl', 'log', 'm']
     return {'libraries': libraries, 'runtimeHeaders': headers, 'linking': {
         'schemaVersion': 1, 'includeDirs': ['include', 'runtime/include/config', 'runtime/include/c++', 'runtime/include/abi'],
