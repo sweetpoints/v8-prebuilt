@@ -131,6 +131,7 @@ def main():
     parser.add_argument('--compiler', type=Path)
     parser.add_argument('--probe-output', type=Path)
     parser.add_argument('--probe-path', type=Path)
+    parser.add_argument('--compile-report', type=Path)
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--compile-only', action='store_true')
     modes.add_argument('--execute-only', action='store_true')
@@ -148,7 +149,7 @@ def main():
         directory = Path(temporary)
         source = directory / 'consumer.cpp'
         source.write_text(PROBE, encoding='utf-8')
-        probe = (args.probe_path if args.execute_only else args.probe_output) or directory / ('consumer.exe' if os.name == 'nt' else 'consumer')
+        probe = (args.probe_path if args.execute_only else args.probe_output) or root / 'validation' / ('sdk-probe.exe' if os.name == 'nt' else 'sdk-probe')
         probe = probe.resolve()
         compiler_version = None
         if not args.execute_only:
@@ -160,11 +161,13 @@ def main():
                     'host': {'os': platform.system(), 'machine': platform.machine()},
                     'nativeConsumerExecuted': False,
                     'cases': ['official_api_compile', 'official_api_link']}
+        if probe.is_relative_to(root):
+            evidence['probe'] = probe.relative_to(root).as_posix()
         if compiler_version is not None:
             evidence['compiler'] = compiler_version
         if args.execute_only:
             # The cross-built executable needs prior compile/link evidence.
-            prior_path = probe.with_name(probe.name + '.json')
+            prior_path = args.compile_report or probe.with_name(probe.name + '.json')
             prior = json.loads(prior_path.read_text(encoding='utf-8'))
             for key in ('version', 'linkingSha256', 'librarySha256', 'libraries', 'probeSha256', 'probeSourceSha256'):
                 if prior.get(key) != evidence[key]:
