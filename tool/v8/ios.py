@@ -168,15 +168,14 @@ def validate_binary(path, source, target, env, run=common.run):
 
 
 def output_for(source, out, depot, env, label):
-    outputs = json.loads(common.run([depot / 'gn', 'desc', out, label, 'outputs', '--format=json',
-                                    '--root-target=//:v8_monolith'], source, env, capture=True))
+    outputs = common.gn_property(source, out, depot, env, label, 'outputs', root_target='//:v8_monolith')
     archives = [source / value.removeprefix('//') for value in outputs if value.endswith('.a')]
     if len(archives) != 1 or not archives[0].is_file() or not archives[0].resolve().is_relative_to(out.resolve()):
         raise ValueError('Expected exactly one built archive inside target output: ' + label)
     return archives[0]
 
 
-def link_contract(target, pins, defines):
+def link_contract(target, pins, defines, frameworks=(), system_libraries=()):
     config = configuration(target, pins)
     return {
         'schemaVersion': 1, 'kind': 'ios-static-sdk', 'target': target, 'architecture': 'arm64',
@@ -185,8 +184,8 @@ def link_contract(target, pins, defines):
         'nativeV8Archive': 'lib/libv8_monolith.a',
         'includeDirs': ['include'], 'defines': defines, 'compileOptions': ['-std=c++20'],
         'libraries': ['lib/libv8_monolith.a'],
-        'linkOptions': ['-framework', 'Foundation', '-framework', 'CoreFoundation'],
-        'systemLibraries': ['c++'],
+        'linkOptions': [arg for name in frameworks for arg in ('-framework', name.removesuffix('.framework'))],
+        'systemLibraries': list(dict.fromkeys(['c++', *system_libraries])),
         'cxxStandard': 'c++20', 'stdlib': 'Xcode SDK libc++ (system; not bundled)',
         'runtimeFlags': ['--jitless'], 'compileTimeJitless': True, 'webAssembly': False,
         'externalStartupData': False, 'dynamicLoading': False,
@@ -201,14 +200,20 @@ def link_smoke(directory, source, target, pins, env):
     probe.write_text(LINK_SMOKE)
     sdk = common.run(['xcrun', '--sdk', SDKS[target], '--show-sdk-path'], source, env, capture=True).strip()
     output = evidence / 'link-smoke'
-    common.run(['xcrun', '--sdk', SDKS[target], 'clang++', '-std=c++20', '-target', contract['clangTarget'],
-                '-isysroot', sdk, '-I', directory / 'include', probe,
-                *['-D' + define for define in contract['defines']],
-                directory / 'lib/libv8_monolith.a', '-lc++',
-                '-framework', 'Foundation', '-framework', 'CoreFoundation', '-Wl,-dead_strip', '-o', output], source, env)
+    command = ['xcrun', '--sdk', SDKS[target], 'clang++', *contract['compileOptions'],
+               '-target', contract['clangTarget'], '-isysroot', sdk]
+    command += ['-I' + str(directory / name) for name in contract['includeDirs']]
+    command += ['-D' + define for define in contract['defines']]
+    command += [probe, *[directory / name for name in contract['libraries']]]
+    command += contract['linkOptions'] + ['-l' + name for name in contract['systemLibraries']]
+    command += ['-Wl,-dead_strip', '-o', output]
+    common.run(command, source, env)
     inspection = inspect_macho(output.read_bytes(), target, filetype=2)
     result = {'passed': True, 'executableInspection': inspection, 'runtimeExecuted': False,
-              'source': 'validation/link-smoke.cpp', 'executable': 'validation/link-smoke'}
+              'source': 'validation/link-smoke.cpp', 'executable': 'validation/link-smoke',
+              'command': [str(argument) for argument in command],
+              'linkingSha256': common.sha(directory / 'linking.json'),
+              'monolithSha256': common.sha(directory / 'lib/libv8_monolith.a')}
     (evidence / 'link-smoke.json').write_text(json.dumps(result, indent=2) + '\n')
     return result
 
@@ -232,8 +237,9 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
     common.run([depot / 'gn', 'gen', out, '--root-target=//:v8_monolith', '--fail-on-unused-args'], source, env)
     common.run([depot / 'autoninja', '-C', out, '-j', jobs, 'v8_monolith'], source, env)
     monolith = output_for(source, out, depot, env, '//:v8_monolith')
-    defines = json.loads(common.run([depot / 'gn', 'desc', out, '//:v8_monolith', 'defines', '--format=json',
-                                    '--root-target=//:v8_monolith'], source, env, capture=True))
+    defines = common.sdk_defines(source, out, depot, env, root_target='//:v8_monolith')
+    frameworks = common.gn_property(source, out, depot, env, '//:v8_monolith', 'frameworks', root_target='//:v8_monolith')
+    system_libraries = common.gn_property(source, out, depot, env, '//:v8_monolith', 'libs', root_target='//:v8_monolith')
     with tempfile.TemporaryDirectory(prefix='v8-ios-sdk-') as staging:
         directory = Path(staging)
         files = common.sdk_headers(source, out)
@@ -249,7 +255,7 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
             expected = expected + (0,) * (3 - len(expected))
             if tuple(map(int, minimum.split('.'))) > expected:
                 raise ValueError('An archive member requires newer iOS than the SDK deployment contract')
-        (directory / 'linking.json').write_text(json.dumps(link_contract(target, pins, defines), indent=2) + '\n')
+        (directory / 'linking.json').write_text(json.dumps(link_contract(target, pins, defines, frameworks, system_libraries), indent=2) + '\n')
         smoke = link_smoke(directory, source, target, pins, env)
         (directory / 'args.gn').write_text(args)
         (directory / 'defines.json').write_text(json.dumps(defines, indent=2) + '\n')

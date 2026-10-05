@@ -94,14 +94,16 @@ class IOSContractTest(unittest.TestCase):
 
     def test_link_contract_is_unambiguous_static_system_libcxx(self):
         for target in ios.TARGETS:
-            contract = ios.link_contract(target, PINS, ['V8_JITLESS'])
+            contract = ios.link_contract(target, PINS, ['V8_JITLESS'], ['Foundation.framework', 'Security.framework'], ['objc'])
             self.assertEqual(contract['schemaVersion'], 1)
             self.assertFalse(contract['dynamicLoading'])
             self.assertEqual(contract['runtimeFlags'], ['--jitless'])
             self.assertEqual(contract['libraries'], ['lib/libv8_monolith.a'])
             self.assertEqual(contract['includeDirs'], ['include'])
             self.assertEqual(contract['defines'], ['V8_JITLESS'])
-            self.assertEqual(contract['systemLibraries'], ['c++'])
+            self.assertEqual(contract['systemLibraries'], ['c++', 'objc'])
+            self.assertEqual(contract['linkOptions'], ['-framework', 'Foundation', '-framework', 'Security'])
+            self.assertNotIn('CoreFoundation', contract['linkOptions'])
             self.assertIn('system; not bundled', contract['stdlib'])
             self.assertFalse(contract['externalStartupData'])
             self.assertNotIn('bridgeArchive', contract)
@@ -114,7 +116,9 @@ class IOSContractTest(unittest.TestCase):
             for target in ios.TARGETS:
                 sdk_dir = root / target
                 sdk_dir.mkdir()
-                contract = ios.link_contract(target, PINS, ['V8_JITLESS'])
+                contract = ios.link_contract(target, PINS, ['V8_JITLESS'], ['Foundation.framework', 'Security.framework'], ['objc'])
+                (sdk_dir / 'lib').mkdir()
+                (sdk_dir / 'lib/libv8_monolith.a').write_bytes(b'static-archive')
                 (sdk_dir / 'linking.json').write_text(json.dumps(contract))
                 commands = []
                 def run(args, *unused, **kwargs):
@@ -126,10 +130,26 @@ class IOSContractTest(unittest.TestCase):
                 self.assertTrue(proof['passed'])
                 self.assertFalse(proof['runtimeExecuted'])
                 self.assertIn('-DV8_JITLESS', commands[-1])
+                self.assertIn('Security', commands[-1])
+                self.assertIn('-lobjc', commands[-1])
+                self.assertNotIn('CoreFoundation', commands[-1])
+                self.assertEqual(proof['linkingSha256'], ios.common.sha(sdk_dir / 'linking.json'))
                 self.assertIn(str(sdk_dir / 'lib/libv8_monolith.a'), commands[-1])
                 self.assertFalse(any('sv8_' in arg for command in commands for arg in command))
                 for name in ['link-smoke', 'link-smoke.cpp', 'link-smoke.json']:
                     self.assertTrue((sdk_dir / 'validation' / name).is_file())
+
+    def test_gn_outputs_property_dict_is_unwrapped_and_target_root_is_pure_v8(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            out = source / 'out/ios'
+            out.mkdir(parents=True)
+            archive = out / 'libv8_monolith.a'
+            archive.write_bytes(b'archive')
+            response = {'//:v8_monolith': {'outputs': ['//out/ios/libv8_monolith.a']}}
+            with patch('ios.common.run', return_value=json.dumps(response)) as run:
+                self.assertEqual(ios.output_for(source, out, source / 'depot', {}, '//:v8_monolith'), archive)
+                self.assertIn('--root-target=//:v8_monolith', run.call_args.args[0])
 
     def test_inventory_indexes_every_file_by_content(self):
         with tempfile.TemporaryDirectory() as directory:
