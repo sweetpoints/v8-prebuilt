@@ -18,6 +18,9 @@ PROBE = r'''#include <cstdio>
 int main(int argc, char** argv) {
   if (argc < 2 || std::strcmp(v8::V8::GetVersion(), argv[1])) return 2;
   if (argc > 2 && argv[2][0]) v8::V8::SetFlagsFromString(argv[2]);
+  // Test the compiled Temporal API without changing the SDK's upstream defaults.
+  v8::V8::SetFlagsFromString("--harmony-temporal");
+  if (!v8::V8::InitializeICUDefaultLocation(argv[0])) return 5;
   auto platform = v8::platform::NewDefaultPlatform();
   v8::V8::InitializePlatform(platform.get());
   if (!v8::V8::Initialize()) return 3;
@@ -36,6 +39,11 @@ int main(int argc, char** argv) {
     auto code = v8::String::NewFromUtf8Literal(isolate,
         "(()=>{ let n=0; for(let i=0;i<10000;i++) n+=i; "
         "if(n!==49995000) throw Error('arithmetic'); "
+        "if(new Intl.NumberFormat('de-DE').format(1234.5)!=='1.234,5') throw Error('Intl'); "
+        "if(new Intl.Segmenter('en',{granularity:'word'}).segment('hello world')[Symbol.iterator]().next().value.segment!=='hello') throw Error('ICU segmentation'); "
+        "if(Temporal.PlainDate.from('2026-10-05').add({days:1}).toString()!=='2026-10-06') throw Error('Temporal'); "
+        "const wasm=new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,7,10,1,6,97,110,115,119,101,114,0,0,10,6,1,4,0,65,42,11]))); "
+        "if(wasm.exports.answer()!==42) throw Error('WebAssembly'); "
         "return Promise.resolve('V8 SDK'); })()");
     v8::Local<v8::Script> script;
     v8::Local<v8::Value> value;
