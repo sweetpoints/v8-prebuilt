@@ -231,8 +231,8 @@ def gn_arguments(target, pins=None):
     cpu = pins['targets'][target]['cpu']
     args = {'is_debug': False, 'is_component_build': False, 'v8_monolithic': True,
             'v8_monolithic_for_shared_library': True, 'v8_use_external_startup_data': False,
-            'use_custom_libcxx': True, 'v8_enable_i18n_support': False,
-            'v8_enable_temporal_support': False, 'use_remoteexec': False,
+            'use_custom_libcxx': True, 'v8_enable_i18n_support': True,
+            'v8_enable_temporal_support': True, 'icu_use_data_file': False, 'use_remoteexec': False,
             'symbol_level': 0, 'use_thin_lto': False, 'target_cpu': cpu, 'v8_target_cpu': cpu}
     if target.startswith('android-'):
         args.update(target_os='android', android_ndk_api_level=26)
@@ -359,7 +359,7 @@ def publish_sdk(source, target, pins, files, entry, output_root=None):
 
 
 def inspect_apple_android_archive(path, target):
-    expected = (0x0100000C if target == 'macos-arm64' else 0x01000007) if target.startswith('macos-') else (183 if target == 'android-arm64' else 62)
+    expected = (0x01000007 if target == 'macos-x64' else 0x0100000C) if target.startswith(('macos-', 'ios-')) else (183 if target == 'android-arm64' else 62)
     count = 0
     total = path.stat().st_size
     with path.open('rb') as archive:
@@ -381,7 +381,7 @@ def inspect_apple_android_archive(path, target):
                 name = archive.read(name_size).rstrip(b'\0').decode('utf-8')
             if name not in ('/', '//', '/SYM64/') and not name.startswith('__.SYMDEF'):
                 data = archive.read(min(32, end - archive.tell()))
-                if target.startswith('macos-'):
+                if target.startswith(('macos-', 'ios-')):
                     if len(data) < 16 or data[:4] != b'\xcf\xfa\xed\xfe':
                         raise ValueError('SDK archive member must be native Mach-O 64')
                     machine, kind = struct.unpack_from('<I', data, 4)[0], struct.unpack_from('<I', data, 12)[0]
@@ -400,6 +400,174 @@ def inspect_apple_android_archive(path, target):
 
 
 
+def archive_members(path):
+    """Yield native/archive metadata members, resolving GNU and BSD names."""
+    with path.open('rb') as archive:
+        if archive.read(8) != b'!<arch>\n':
+            raise ValueError('Rust SDK input must be a complete archive: ' + str(path))
+        names = b''
+        total = path.stat().st_size
+        while archive.tell() < total:
+            header = archive.read(60)
+            if len(header) != 60 or header[58:] != b'`\n':
+                raise ValueError('Invalid Rust archive header')
+            name = header[:16].decode('ascii').strip()
+            size = int(header[48:58].decode('ascii').strip())
+            if size < 0 or size > total - archive.tell():
+                raise ValueError('Truncated Rust archive')
+            payload = archive.read(size)
+            if size % 2 and archive.read(1) != b'\n':
+                raise ValueError('Invalid Rust archive padding')
+            if name == '//':
+                names = payload
+                continue
+            if name in ('/', '/SYM64/') or name.startswith('__.SYMDEF'):
+                continue
+            if name.startswith('#1/'):
+                length = int(name[3:])
+                if length < 0 or length > len(payload):
+                    raise ValueError('Invalid Rust BSD member name')
+                name = payload[:length].rstrip(b'\0').decode('utf-8')
+                payload = payload[length:]
+            elif re.fullmatch(r'/[0-9]+', name):
+                offset = int(name[1:])
+                end = names.find(b'/\n', offset)
+                if offset >= len(names) or end < 0:
+                    raise ValueError('Invalid Rust GNU member name')
+                name = names[offset:end].decode('utf-8')
+            else:
+                name = name.removesuffix('/')
+            if name.startswith('__.SYMDEF'):
+                continue
+            yield name, payload
+
+
+def validate_rust_object(data, target):
+    if target.startswith(('macos-', 'ios-')):
+        expected = 0x01000007 if target == 'macos-x64' else 0x0100000C
+        if len(data) < 16 or data[:4] != b'\xcf\xfa\xed\xfe':
+            raise ValueError('Rust SDK object must be native Mach-O64 (no LLVM bitcode)')
+        machine, kind = struct.unpack_from('<I', data, 4)[0], struct.unpack_from('<I', data, 12)[0]
+        if machine != expected or kind != 1:
+            raise ValueError('Rust SDK Mach-O object architecture mismatch')
+    elif target.startswith('windows-'):
+        expected = 0xAA64 if target.endswith('arm64') else 0x8664
+        machine = struct.unpack_from('<H', data, 6 if data[:4] == b'\0\0\xff\xff' else 0)[0] if len(data) >= 20 else 0
+        if machine != expected:
+            raise ValueError('Rust SDK object must be matching native COFF (no LLVM bitcode)')
+    else:
+        expected = 183 if target.endswith('arm64') else 62
+        if len(data) < 20 or data[:6] != b'\x7fELF\x02\x01':
+            raise ValueError('Rust SDK object must be native ELF64 (no LLVM bitcode)')
+        kind, machine = struct.unpack_from('<HH', data, 16)
+        if machine != expected or kind != 1:
+            raise ValueError('Rust SDK ELF object architecture mismatch')
+
+
+def ninja_list(value):
+    # GN writes these concrete paths as Ninja tokens, including $-escaped spaces.
+    tokens, token, index = [], '', 0
+    while index < len(value):
+        char = value[index]
+        if char == '$':
+            index += 1
+            if index >= len(value) or value[index] not in (' ', '$', ':'):
+                raise ValueError('Unexpected variable in GN Rust archive paths')
+            token += value[index]
+        elif char.isspace():
+            if token: tokens.append(token); token = ''
+        else:
+            token += char
+        index += 1
+    if token: tokens.append(token)
+    return tokens
+
+
+def sdk_rust_inputs(source, out):
+    # The static-library alink rule does not include GN's implicit rlibs in its
+    # response file. Use the exact target link list rather than all host crates.
+    ninja = out / 'obj/v8_monolith.ninja'
+    text = ninja.read_text().replace('$\n', '')
+    values = re.findall(r'^  rlibs = (.*)$', text, re.MULTILINE)
+    if len(values) != 1:
+        raise ValueError('Full V8 SDK requires one official monolith Rust link list')
+    paths = list(dict.fromkeys(ninja_list(values[0])))
+    if not paths or not any('temporal_capi' in path for path in paths) or not any('libstd_' in path for path in paths):
+        raise ValueError('Full V8 SDK Rust link list must include Temporal and Rust stdlib')
+    inputs = []
+    for name in paths:
+        path = (out / name).resolve()
+        if not path.is_relative_to(source.resolve()) or path.suffix != '.rlib':
+            raise ValueError('Rust SDK input escapes fixed V8 source or is not an rlib')
+        inputs.append(path)
+    return inputs
+
+
+def sdk_rust_runtime(source, out, target, env):
+    inputs = sdk_rust_inputs(source, out)
+    metadata = out / 'sdk-metadata'; metadata.mkdir(exist_ok=True)
+    destination = metadata / ('v8_rust_runtime.lib' if target.startswith('windows-') else 'libv8_rust_runtime.a')
+    evidence, count = [], 0
+    with destination.open('wb') as archive:
+        archive.write(b'!<arch>\n')
+        for input_index, path in enumerate(inputs):
+            objects, skipped = 0, 0
+            for name, data in archive_members(path):
+                if name.endswith('.rmeta'):
+                    skipped += 1
+                    continue
+                validate_rust_object(data, target)
+                # Archive member names may repeat across crates; unique short
+                # names preserve every native object when indexing/linking.
+                member = f'r{input_index:04x}{objects:06x}.o/'
+                header = f'{member:<16}{0:<12}{0:<6}{0:<6}{100644:<8}{len(data):<10}`\n'.encode('ascii')
+                if len(header) != 60:
+                    raise ValueError('Rust SDK object exceeds archive header limits')
+                archive.write(header); archive.write(data)
+                if len(data) % 2: archive.write(b'\n')
+                objects += 1
+            count += objects
+            evidence.append({'path': path.relative_to(source.resolve()).as_posix(), 'sha256': sha(path),
+                             'nativeObjects': objects, 'metadataMembersOmitted': skipped})
+    if count == 0:
+        raise ValueError('Rust SDK runtime has no native objects')
+    tool = source / ('third_party/llvm-build/Release+Asserts/bin/llvm-ar.exe' if target.startswith('windows-') else
+                     'third_party/llvm-build/Release+Asserts/bin/llvm-ar')
+    run([tool, ('--format=darwin' if target.startswith(('macos-', 'ios-')) else '--format=gnu'), 's', destination], source, env)
+    report = metadata / 'rust-runtime.json'
+    report.write_text(json.dumps({'schemaVersion': 1, 'target': target, 'inputs': evidence,
+                                 'nativeObjects': count, 'sha256': sha(destination)}, indent=2) + '\n')
+    return destination, report
+
+
+def sdk_archive_dependency(source, out, path, target, env):
+    path = path.resolve()
+    if not path.is_relative_to(source.resolve()) or path.suffix not in ('.a', '.lib'):
+        raise ValueError('SDK archive dependency must come from fixed source checkout')
+    with path.open('rb') as handle:
+        magic = handle.read(4)
+    if magic in (b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'):
+        if not target.startswith(('macos-', 'ios-')):
+            raise ValueError('Universal Apple archive on non-Apple target')
+        output = out / 'sdk-metadata/archive-dependencies' / path.name
+        output.parent.mkdir(parents=True, exist_ok=True)
+        run(['xcrun', 'lipo', '-thin', 'x86_64' if target == 'macos-x64' else 'arm64', path, '-output', output], source, env)
+        path = output
+    if target.startswith(('windows-', 'linux-')):
+        platform_module('desktop').inspect_archive(path, target)
+    else:
+        inspect_apple_android_archive(path, target)
+    return path
+
+
+def sdk_library_arguments(root, contract):
+    grouping = contract.get('staticLibraryGrouping')
+    if grouping not in (None, 'rescan'):
+        raise ValueError('Unsupported static library grouping policy')
+    libraries = [root / name for name in contract['libraries']]
+    return ['-Wl,--start-group', *libraries, '-Wl,--end-group'] if grouping == 'rescan' else libraries
+
+
 def sdk_abi_options(source, out, depot, env):
     flags = gn_property(source, out, depot, env, '//:v8_monolith', 'cflags_cc')
     names = {'-fexperimental-relative-c++-abi-vtables', '-fno-experimental-relative-c++-abi-vtables'}
@@ -409,13 +577,33 @@ def sdk_abi_options(source, out, depot, env):
 ANDROID_LINK_PROBE = """#include <v8.h>
 #include <libplatform/libplatform.h>
 extern "C" int v8_sdk_link_test() {
-  const char *version = v8::V8::GetVersion();
+  if (!v8::V8::InitializeICUDefaultLocation(nullptr)) return 2;
   auto platform = v8::platform::NewDefaultPlatform();
   v8::V8::InitializePlatform(platform.get());
-  bool initialized = v8::V8::Initialize();
-  if (initialized) v8::V8::Dispose();
+  if (!v8::V8::Initialize()) return 1;
+  auto allocator = v8::ArrayBuffer::Allocator::NewDefaultAllocator();
+  v8::Isolate::CreateParams params;
+  params.array_buffer_allocator = allocator;
+  auto isolate = v8::Isolate::New(params);
+  int result = 1;
+  {
+    v8::Isolate::Scope isolate_scope(isolate);
+    v8::HandleScope handle_scope(isolate);
+    auto context = v8::Context::New(isolate);
+    v8::Context::Scope context_scope(context);
+    auto code = v8::String::NewFromUtf8Literal(isolate,
+        "new Intl.NumberFormat('de-DE').format(1234.5) === '1.234,5' && "
+        "Temporal.PlainDate.from('2024-01-02').add({days:1}).toString() === '2024-01-03' && "
+        "typeof WebAssembly.compile === 'function' && typeof Promise === 'function'");
+    auto script = v8::Script::Compile(context, code).ToLocalChecked();
+    auto value = script->Run(context).ToLocalChecked();
+    result = value->BooleanValue(isolate) ? 0 : 1;
+  }
+  isolate->Dispose();
+  delete allocator;
+  v8::V8::Dispose();
   v8::V8::DisposePlatform();
-  return initialized && version[0] ? 0 : 1;
+  return result;
 }
 """
 
@@ -459,7 +647,7 @@ def android_link_smoke(source, target, sdk_root, compiler, env):
     command += ['-I' + str(sdk_root / name) for name in contract['includeDirs']]
     command += ['-D' + value for value in contract['defines']]
     command += [probe, '-o', binary]
-    command += [sdk_root / name for name in contract['libraries']]
+    command += sdk_library_arguments(sdk_root, contract)
     command += contract['linkOptions']
     command += ['-l' + value for value in contract['systemLibraries']]
     run(command, source, env)
@@ -483,6 +671,7 @@ def apple_android_profile(source, out, target, pins, defines, depot, env):
     monolith = gn_output(source, out, depot, env, '//:v8_monolith')
     runtime = gn_output(source, out, depot, env, '//sdk_runtime:v8_cxx_runtime')
     libraries = {'lib/' + monolith.name: monolith, 'lib/' + runtime.name: runtime}
+    archive_dependencies, official_system_libraries = [], []
     for library in libraries.values():
         inspect_apple_android_archive(library, target)
     if target.startswith('android-'):
@@ -535,7 +724,16 @@ def apple_android_profile(source, out, target, pins, defines, depot, env):
             raise ValueError('Pinned Android custom runtime must disable toolchain unwind library')
         link += ['--target=' + triple, '-Wl,-z,max-page-size=16384', '--unwindlib=none']
         systems = ['dl', 'log', 'm']
-    return {'libraries': libraries, 'runtimeHeaders': headers, 'linking': {
+    official_libraries = gn_property(source, out, depot, env, '//:v8_monolith', 'libs')
+    for library in official_libraries:
+        if library.startswith('//'):
+            archive_dependencies.append(source / library[2:])
+        elif re.fullmatch(r'[A-Za-z0-9_+.-]+', library) and not library.endswith(('.a', '.lib')):
+            official_system_libraries.append(library)
+        else:
+            raise ValueError('Unsupported official SDK dependency library: ' + library)
+    systems = list(dict.fromkeys(systems + official_system_libraries))
+    return {'libraries': libraries, 'runtimeHeaders': headers, 'archiveDependencies': archive_dependencies, 'linking': {
         'schemaVersion': 1, 'includeDirs': ['include', 'runtime/include/config', 'runtime/include/c++', 'runtime/include/abi'],
         'defines': defines, 'compileOptions': options, 'libraries': list(libraries),
         'linkOptions': link, 'systemLibraries': systems,
@@ -569,7 +767,24 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
         abi_flags = [flag if flag.startswith('/clang:') else '/clang:' + flag for flag in abi_flags]
     profile['linking']['compileOptions'] += abi_flags
     profile['linking']['abiCompileOptions'] = list(dict.fromkeys(profile['linking'].get('abiCompileOptions', []) + abi_flags))
+    for dependency in profile.get('archiveDependencies', []):
+        library = sdk_archive_dependency(source, out, dependency, target, env)
+        name = 'lib/' + library.name
+        if name in profile['libraries'] and sha(profile['libraries'][name]) != sha(library):
+            raise ValueError('SDK archive dependency filename conflict: ' + name)
+        profile['libraries'][name] = library
+        if name not in profile['linking']['libraries']: profile['linking']['libraries'].append(name)
+    rust_runtime, rust_evidence = sdk_rust_runtime(source, out, target, env)
+    rust_name = 'lib/' + rust_runtime.name
+    profile['libraries'][rust_name] = rust_runtime
+    profile['linking']['libraries'].insert(1, rust_name)
+    if target.startswith(('linux-', 'android-')):
+        profile['linking']['staticLibraryGrouping'] = 'rescan'
+    profile['linking']['featureProfile'] = {'internationalization': True, 'temporal': True,
+        'icuData': 'embedded', 'jit': 'upstream-default', 'webAssembly': 'upstream-default',
+        'experimentalRuntimeFlags': []}
     files = sdk_headers(source, out) | profile['libraries'] | profile['runtimeHeaders']
+    files['rust-runtime.json'] = rust_evidence
     files |= {'build-inputs/' + path.name: path for path in build_inputs.values()}
     metadata = out / 'sdk-metadata'
     metadata.mkdir(exist_ok=True)

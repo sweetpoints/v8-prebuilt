@@ -1,6 +1,9 @@
 """Offline pure SDK contracts: no downloads, source compilation or app bridge."""
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
 import struct
 from pathlib import Path
 import tempfile
@@ -47,6 +50,9 @@ class BuildContractTests(unittest.TestCase):
             self.assertIn('v8_monolithic_for_shared_library = true', args)
             self.assertIn('v8_use_external_startup_data = false', args)
             self.assertIn('use_custom_libcxx = true', args)
+            self.assertIn('v8_enable_i18n_support = true', args)
+            self.assertIn('v8_enable_temporal_support = true', args)
+            self.assertIn('icu_use_data_file = false', args)
         self.assertIn('target_cpu = "x64"', builder.gn_arguments('macos-x64'))
         self.assertIn('android_ndk_api_level = 26', builder.gn_arguments('android-arm64'))
         with self.assertRaises(ValueError): builder.gn_arguments('unknown')
@@ -179,7 +185,7 @@ class BuildContractTests(unittest.TestCase):
             runtime = source / 'libv8_cxx_runtime.a'; runtime.write_text('runtime')
             with patch.object(builder, 'gn_output', side_effect=[monolith, runtime]), \
                  patch.object(builder, 'inspect_apple_android_archive'), \
-                 patch.object(builder, 'gn_property', return_value=['Foundation.framework', 'CoreFoundation.framework', 'Security.framework']):
+                 patch.object(builder, 'gn_property', side_effect=[['Foundation.framework', 'CoreFoundation.framework', 'Security.framework'], ['//third_party/clang/libclang_rt.osx.a']]):
                 profile = builder.apple_android_profile(source, out, 'macos-arm64', builder.read_pins(), [], Path('/depot'), {})
             self.assertIn('runtime/include/config/__assertion_handler', profile['runtimeHeaders'])
             self.assertEqual(profile['linking']['linkOptions'][-6:],
@@ -198,7 +204,7 @@ class BuildContractTests(unittest.TestCase):
             for official_flags in (['--unwindlib=none', '--sysroot=/build/cache', '-Werror'], []):
                 with patch.object(builder, 'gn_output', side_effect=[monolith, runtime]), \
                      patch.object(builder, 'inspect_apple_android_archive'), \
-                     patch.object(builder, 'gn_property', return_value=official_flags) as property:
+                     patch.object(builder, 'gn_property', side_effect=[official_flags, ['dl']]) as property:
                     if not official_flags:
                         with self.assertRaisesRegex(ValueError, 'disable toolchain unwind'):
                             builder.apple_android_profile(source, out, 'android-arm64', builder.read_pins(), [], Path('/depot'), {})
@@ -207,7 +213,7 @@ class BuildContractTests(unittest.TestCase):
                     self.assertIn('--unwindlib=none', profile['linking']['linkOptions'])
                     self.assertNotIn('--sysroot=/build/cache', profile['linking']['linkOptions'])
                     self.assertEqual(list(profile['libraries']), ['lib/libv8_monolith.a', 'lib/libv8_cxx_runtime.a', 'lib/' + builtin.name])
-                    self.assertEqual(property.call_args.args[-1], 'ldflags')
+                    self.assertEqual(property.call_args_list[0].args[-1], 'ldflags')
 
     def test_sdk_abi_options_keep_actual_relative_vtable_flag(self):
         with patch.object(builder, 'gn_property', return_value=['-std=c++20', '-fexperimental-relative-c++-abi-vtables', '--sysroot=/private/cache']):
@@ -224,7 +230,7 @@ class BuildContractTests(unittest.TestCase):
             contract = {'schemaVersion':1, 'includeDirs':['include'], 'defines':['V8_ENABLE_SANDBOX'],
                         'compileOptions':['-std=c++20', '--target=aarch64-linux-android26'],
                         'libraries':['lib/libv8_monolith.a'], 'linkOptions':['-nostdlib++', '-Wl,-z,max-page-size=16384', '--unwindlib=none'],
-                        'systemLibraries':['dl', 'm'], 'sysrootRequirement':{'kind':'android-ndk'}}
+                        'systemLibraries':['dl', 'm'], 'staticLibraryGrouping':'rescan', 'sysrootRequirement':{'kind':'android-ndk'}}
             (sdk / 'linking.json').write_text(json.dumps(contract))
             def linked_elf(machine=183, alignment=16384):
                 data = bytearray(120); data[:6] = b'\x7fELF\x02\x01'
@@ -247,8 +253,12 @@ class BuildContractTests(unittest.TestCase):
             self.assertEqual(len(files), 3)
             self.assertIn('-Wl,--no-undefined', calls[0])
             self.assertIn('--unwindlib=none', calls[0])
+            self.assertLess(calls[0].index('-Wl,--start-group'), calls[0].index(monolith))
+            self.assertGreater(calls[0].index('-Wl,--end-group'), calls[0].index(monolith))
             self.assertIn('--sysroot=' + str(sysroot), calls[0])
             self.assertNotIn('source_v8', (sdk / 'validation/android-sdk-link.cc').read_text())
+            self.assertIn('InitializeICUDefaultLocation', builder.ANDROID_LINK_PROBE)
+            self.assertIn('Temporal.PlainDate', builder.ANDROID_LINK_PROBE)
             binary = sdk / 'validation/libv8_sdk_link_test.so'
             for machine, alignment in [(62,16384), (183,4096)]:
                 binary.write_bytes(linked_elf(machine,alignment))
@@ -367,6 +377,132 @@ class BootstrapReuseTests(unittest.TestCase):
             with patch.object(builder, 'require_host'), patch.object(builder, 'run', side_effect=OSError('bootstrap failure')):
                 with self.assertRaises(OSError): builder.bootstrap(root, 'macos-arm64', pins)
             self.assertFalse(marker.exists())
+
+
+class RustSdkTests(unittest.TestCase):
+    def ar(self, members):
+        result = b'!<arch>\n'
+        for name, data in members:
+            header = f'{name:<16}{0:<12}{0:<6}{0:<6}{100644:<8}{len(data):<10}`\n'.encode('ascii')
+            result += header + data + (b'\n' if len(data) % 2 else b'')
+        return result
+
+    def object(self, target):
+        data = bytearray(32)
+        if target.startswith(('macos-', 'ios-')):
+            data[:4] = b'\xcf\xfa\xed\xfe'
+            struct.pack_into('<I', data, 4, 0x01000007 if target.endswith('x64') else 0x0100000c)
+            struct.pack_into('<I', data, 12, 1)
+        elif target.startswith('windows-'):
+            struct.pack_into('<HH', data, 0, 0x8664 if target.endswith('x64') else 0xaa64, 1)
+        else:
+            data[:6] = b'\x7fELF\x02\x01'
+            struct.pack_into('<HH', data, 16, 1, 62 if target.endswith('x64') else 183)
+        return bytes(data)
+
+    def test_native_object_architectures_and_bitcode_rejection(self):
+        for target in builder.TARGETS:
+            builder.validate_rust_object(self.object(target), target)
+            with self.assertRaises(ValueError): builder.validate_rust_object(b'BC\xc0\xde' + b'0'*28, target)
+            wrong = ('windows-arm64' if target == 'windows-x64' else 'windows-x64') if target.startswith('windows-') else ('macos-x64' if target.startswith(('macos-', 'ios-')) and target != 'macos-x64' else 'macos-arm64')
+            with self.assertRaises(ValueError): builder.validate_rust_object(self.object(wrong), target)
+        bigobj = bytearray(32); bigobj[:4] = b'\0\0\xff\xff'; struct.pack_into('<HH', bigobj, 4, 2, 0x8664)
+        builder.validate_rust_object(bytes(bigobj), 'windows-x64')
+
+    def test_gnu_and_bsd_member_names_resolve_metadata_exactly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fixture.rlib'; obj = self.object('linux-x64')
+            names = b'long_member_name.rmeta/\nlong_native_member.o/\n'
+            path.write_bytes(self.ar([('//', names), ('/0', b'opaque metadata'), ('/24', obj)]))
+            self.assertEqual(list(builder.archive_members(path)), [('long_member_name.rmeta', b'opaque metadata'), ('long_native_member.o', obj)])
+            name = b'duplicate.o'
+            path.write_bytes(self.ar([('#1/11', name + obj)]))
+            self.assertEqual(list(builder.archive_members(path)), [('duplicate.o', obj)])
+
+    def test_rust_runtime_merges_all_unique_objects_and_omits_metadata(self):
+        for target in ('macos-arm64','linux-x64','windows-arm64'):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory); out = source / 'out/sdk'; (out/'obj').mkdir(parents=True)
+                inputs = []
+                for name in ('libtemporal_capi_lib.rlib', 'libstd_std.rlib'):
+                    path = out/'obj'/name; path.write_bytes(self.ar([('lib.rmeta/', b'meta'), ('same.o/', self.object(target))])); inputs.append(path)
+                (out/'obj/v8_monolith.ninja').write_text('  rlibs = obj/libtemporal_capi_lib.rlib obj/libstd_std.rlib\n')
+                with patch.object(builder,'run') as command:
+                    runtime, report = builder.sdk_rust_runtime(source, out, target, {})
+                members = list(builder.archive_members(runtime))
+                self.assertEqual(len(members), 2)
+                self.assertEqual(len({name for name, _ in members}), 2)
+                self.assertFalse(any(name.endswith('.rmeta') for name, _ in members))
+                evidence = json.loads(report.read_text())
+                self.assertEqual(evidence['nativeObjects'],2)
+                self.assertEqual(evidence['sha256'],builder.sha(runtime))
+                self.assertEqual([item['sha256'] for item in evidence['inputs']], [builder.sha(path) for path in inputs])
+                self.assertEqual([item['metadataMembersOmitted'] for item in evidence['inputs']], [1,1])
+                self.assertIn('s', command.call_args.args[0])
+                if target.startswith('macos-'): self.assertIn('--format=darwin', command.call_args.args[0])
+                else: self.assertIn('--format=gnu', command.call_args.args[0])
+
+    def test_exact_target_list_excludes_host_libraries_and_checks_source_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory);out=source/'out/sdk';(out/'obj').mkdir(parents=True)
+            file=out/'obj/v8_monolith.ninja'
+            file.write_text('  rlibs = obj/libtemporal_capi_lib.rlib obj/libstd_std.rlib\n')
+            self.assertEqual(len(builder.sdk_rust_inputs(source,out)),2)
+            for value in ('obj/libtemporal_capi_lib.rlib /outside/libstd_std.rlib', 'obj/libtemporal_capi_lib.rlib', '$unexpected'):
+                file.write_text('  rlibs = '+value+'\n')
+                with self.assertRaises(ValueError):builder.sdk_rust_inputs(source,out)
+            self.assertEqual(builder.ninja_list('obj/crate$ name.rlib obj/libstd_std.rlib'),['obj/crate name.rlib','obj/libstd_std.rlib'])
+
+    def test_actual_clang_objects_merge_and_macos_fixture_links(self):
+        tools = os.environ.get('V8_SDK_TEST_LLVM_DIR')
+        clang = Path(tools) / 'clang' if tools else Path(shutil.which('clang') or '/missing/clang')
+        ar = Path(tools) / 'llvm-ar' if tools else Path(shutil.which('llvm-ar') or '/missing/llvm-ar')
+        nm = Path(tools) / 'llvm-nm' if tools else Path(shutil.which('llvm-nm') or '/missing/llvm-nm')
+        if not all(path.is_file() for path in (clang, ar, nm)):
+            self.skipTest('Real LLVM fixture requires clang/llvm-ar/llvm-nm or V8_SDK_TEST_LLVM_DIR')
+        triples = {'linux-x64':'x86_64-unknown-linux-gnu', 'windows-x64':'x86_64-pc-windows-msvc',
+                   'macos-arm64':'arm64-apple-macos13.0'}
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory); out=source/'out/sdk';(out/'obj').mkdir(parents=True)
+            bin=source/'third_party/llvm-build/Release+Asserts/bin';bin.mkdir(parents=True)
+            for name in ('llvm-ar','llvm-ar.exe'):
+                try: (bin/name).symlink_to(ar)
+                except OSError: shutil.copyfile(ar,bin/name)
+            def execute(arguments,cwd,env=None,capture=False):
+                result = subprocess.run([str(value) for value in arguments],cwd=cwd,env=env,
+                                        text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                if result.returncode: raise AssertionError(result.stderr)
+                return result.stdout
+            for target,triple in triples.items():
+                inputs=[]
+                for index,name in enumerate(('libtemporal_capi_lib.rlib','libstd_std.rlib')):
+                    crate=out/str(index);crate.mkdir(exist_ok=True)
+                    c=crate/'crate.c';c.write_text(f'int crate_{index}(void) {{return {20+index*2};}}')
+                    obj=crate/'same.o'
+                    execute([clang,'--target='+triple,'-c',c,'-o',obj],source)
+                    metadata=crate/'verylongmetadata.rmeta';metadata.write_bytes(b'opaque Rust metadata')
+                    archive=out/'obj'/name
+                    archive.unlink(missing_ok=True)
+                    execute([ar,'--format=gnu','rcs',archive,obj,metadata],source)
+                    inputs.append(archive)
+                (out/'obj/v8_monolith.ninja').write_text('  rlibs = obj/libtemporal_capi_lib.rlib obj/libstd_std.rlib\n')
+                with patch.object(builder,'run',side_effect=execute):
+                    runtime,report=builder.sdk_rust_runtime(source,out,target,{})
+                symbols=execute([nm,'--defined-only',runtime],source)
+                self.assertIn('crate_0',symbols);self.assertIn('crate_1',symbols)
+                self.assertEqual(json.loads(report.read_text())['nativeObjects'],2)
+                if target=='macos-arm64' and builder.platform.system()=='Darwin' and builder.platform.machine()=='arm64':
+                    main=out/'main.c';main.write_text('int crate_0(void); int crate_1(void); int main(void){return crate_0()+crate_1()==42?0:1;}')
+                    sdk=execute(['xcrun','--show-sdk-path'],source).strip()
+                    binary=out/'rust-sdk-fixture'
+                    execute([clang,'--target='+triple,'-isysroot',sdk,main,runtime,'-o',binary],source)
+                    execute([binary],source)
+
+    def test_grouping_requires_known_policy_and_places_rescan_around_libraries(self):
+        contract={'libraries':['lib/a.a','lib/b.a'],'staticLibraryGrouping':'rescan'}
+        self.assertEqual(builder.sdk_library_arguments(Path('/sdk'),contract),['-Wl,--start-group',Path('/sdk/lib/a.a'),Path('/sdk/lib/b.a'),'-Wl,--end-group'])
+        contract['staticLibraryGrouping']='whole-archive'
+        with self.assertRaises(ValueError):builder.sdk_library_arguments(Path('/sdk'),contract)
 
 
 if __name__ == '__main__': unittest.main()
