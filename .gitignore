@@ -1,0 +1,17 @@
+# Official V8/depot_tools source checkouts and compiler outputs
+.cache/
+
+# Generated release artifacts and local verification outputs
+artifacts/
+dist/
+*.publishing
+
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local editor and OS metadata
+.DS_Store
+.idea/
+.vscode/

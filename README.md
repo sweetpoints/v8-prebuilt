@@ -1,0 +1,108 @@
+# v8-prebuilt
+
+Build the official V8 stable source with the `source_v8` C ABI bridge and publish
+checksummed artifacts for Android, iOS, macOS, Linux and Windows. This repository
+produces the bridge library and its provenance together. It does not download a
+third party V8 binary and wrap it afterwards.
+
+The initial source pin is V8 **15.4.80.24**, revision
+`e422f6ef0c7b877b04e4872fd0bd3a1cc2ec2eee`. V8 and depot_tools come from their
+[official V8 repository](https://chromium.googlesource.com/v8/v8.git) and
+[official depot_tools repository](https://chromium.googlesource.com/chromium/tools/depot_tools.git).
+The release pin file records full revisions; the version label alone is not a
+source identity.
+
+## Targets
+
+| Platform | Target | Architecture | Execution policy |
+|---|---|---|---|
+| Android | `android-arm64` | arm64-v8a | V8 JIT |
+| Android | `android-x64` | x86_64 | V8 JIT |
+| iOS device | `ios-arm64` | ARM64 | JITless |
+| iOS simulator | `ios-simulator-arm64` | ARM64 | JITless |
+| macOS | `macos-arm64` | ARM64 | V8 JIT |
+| macOS | `macos-x64` | x86_64 | V8 JIT |
+| Linux | `linux-x64` | x86_64 | V8 JIT |
+| Linux | `linux-arm64` | ARM64 | V8 JIT |
+| Windows | `windows-x64` | x86_64 | V8 JIT |
+| Windows | `windows-arm64` | ARM64 | V8 JIT |
+
+These are the build matrix targets. A target appearing in this table does not
+establish a successful CI build, device execution or consumer acceptance.
+There is no published-release or completed-CI claim for this initial checkout.
+
+iOS uses JITless V8 and cannot be treated as equivalent to the JIT targets.
+Applications must observe the runtime policy and deployment requirements in each
+artifact's manifest. macOS applications adopting Hardened Runtime need the JIT
+entitlement when using the JIT build; packaging a library does not configure a
+consumer's app signing or entitlements.
+
+## Download a released target
+
+Release archives use `v8-<version>-<target>.tar.gz`. Each archive contains its
+single-target manifest, resolved `pins.json`, the binary, SDK header and collected
+license files. A complete release also includes `release-manifest.json`,
+`pins.json` and `SHA256SUMS`. Until a release is published, these filenames are
+the packaging contract rather than available downloads.
+
+For example, after the desired release exists:
+
+```sh
+version=15.4.80.24
+target=android-arm64
+gh release download "v8-$version" --repo sweetpoints/v8-prebuilt \
+  --pattern "v8-$version-$target.tar.gz" --pattern SHA256SUMS \
+  --pattern release-manifest.json --pattern pins.json
+python3 - "$version" "$target" <<'PYVERIFY'
+import hashlib, pathlib, sys
+name = f"v8-{sys.argv[1]}-{sys.argv[2]}.tar.gz"
+checks = dict(line.split(None, 1)[::-1] for line in pathlib.Path('SHA256SUMS').read_text().splitlines())
+expected = checks[name]
+actual = hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()
+if actual != expected:
+    raise SystemExit('archive SHA-256 mismatch')
+print('archive SHA-256 verified')
+PYVERIFY
+tar -xzf "v8-$version-$target.tar.gz"
+```
+
+Also verify the extracted manifest's full source and bridge identity, selected
+target and individual binary hash before loading or linking it. SHA256SUMS
+checks integrity against the release metadata; it is not an independent digital
+signature. Consumers should pin an exact release and approved artifact digest.
+iOS provides static archives and SDK headers rather than a normal dynamic
+library; follow the iOS target's linking metadata.
+
+## Source and artifact identity
+
+The build pin fixes official V8 and depot_tools revisions. Dependency sources
+and compiler inputs follow that V8 revision's DEPS; each target records the
+actual host/toolchain identity and hashes of GN arguments, DEPS, dependency
+inventory and build definitions. The bridge source hash and C ABI version are
+part of the artifact manifest. A consumer must validate both upstream and bridge
+identity, target, minimum OS/API, binary size and SHA-256.
+
+The builder compiles the C ABI bridge within the V8 GN graph. Consumers call the
+C interface in `src/source_v8.h`; they do not link an independently compiled C++
+wrapper against an arbitrary V8 C++ ABI. Build validation and runtime/source
+compatibility validation are separate manifest fields. A successful link is
+not a successful device test or evidence that all historical book sources work.
+
+A release tag has the form `v8-<version>` and identifies the **builder repository
+commit**. The release also carries the resolved pin file and full upstream
+source revision. The updater does not automatically commit a changed pins.json.
+All required matrix targets and release verification must pass before a release
+is published; a partial matrix is not a complete release.
+
+## Licensing
+
+The bridge and repository code are covered by the [GPL-3.0 license](LICENSE).
+V8 and its third party dependencies retain their own upstream licenses; the
+bridge's GPL license does not replace those notices. Build artifacts include
+collected upstream license/notice files and their hashes. Notice collection is
+not a claim that every redistribution obligation has been independently audited.
+
+Because the packaged library combines the bridge and V8, consumers must account
+for the bridge's license as well as V8 and dependency licenses when distributing
+it. These artifacts are not offered as a BSD-only V8 distribution. Corresponding
+source must be recoverable from the builder tag, source pins and recorded inputs.
