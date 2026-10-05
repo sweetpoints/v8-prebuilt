@@ -22,6 +22,7 @@ LINK_SMOKE = '''#include "v8.h"
 #include "libplatform/libplatform.h"
 int main() {
   v8::V8::SetFlagsFromString("--jitless");
+  if (!v8::V8::InitializeICUDefaultLocation(nullptr)) return 2;
   auto platform = v8::platform::NewDefaultPlatform();
   v8::V8::InitializePlatform(platform.get());
   if (!v8::V8::Initialize()) return 1;
@@ -35,10 +36,13 @@ int main() {
     v8::HandleScope handle_scope(isolate);
     auto context = v8::Context::New(isolate);
     v8::Context::Scope context_scope(context);
-    auto code = v8::String::NewFromUtf8Literal(isolate, "1 + 2");
+    auto code = v8::String::NewFromUtf8Literal(isolate,
+        "new Intl.NumberFormat('de-DE').format(1234.5) === '1.234,5' && "
+        "Array.from(new Intl.Segmenter('en', {granularity:'word'}).segment('hello world')).length === 3 && "
+        "Temporal.PlainDate.from('2024-01-02').add({days:1}).toString() === '2024-01-03'");
     auto script = v8::Script::Compile(context, code).ToLocalChecked();
     auto value = script->Run(context).ToLocalChecked();
-    result = value->Int32Value(context).FromMaybe(0) == 3 ? 0 : 1;
+    result = value->BooleanValue(isolate) ? 0 : 1;
   }
   isolate->Dispose();
   delete allocator;
@@ -93,8 +97,8 @@ def gn_arguments(target, pins):
         'treat_warnings_as_errors': False,
         'is_debug': False, 'is_component_build': False, 'v8_monolithic': True,
         'v8_monolithic_for_shared_library': False, 'v8_use_external_startup_data': False,
-        'use_custom_libcxx': False, 'v8_enable_i18n_support': False,
-        'v8_enable_temporal_support': False, 'v8_enable_pointer_compression': False,
+        'use_custom_libcxx': False, 'v8_enable_i18n_support': True, 'icu_use_data_file': False,
+        'v8_enable_temporal_support': True, 'v8_enable_pointer_compression': False,
         'v8_enable_sandbox': False, 'v8_jitless': True,
         'v8_enable_turbofan': False, 'v8_enable_maglev': False,
         'v8_enable_sparkplug': False, 'v8_enable_webassembly': False,
@@ -213,6 +217,9 @@ def link_contract(target, pins, defines, frameworks=(), system_libraries=(), arc
         'cxxStandard': 'c++20', 'stdlib': 'Xcode SDK libc++ (system; not bundled)',
         'runtimeFlags': ['--jitless'], 'compileTimeJitless': True, 'webAssembly': False,
         'externalStartupData': False, 'dynamicLoading': False,
+        'featureProfile': {'internationalization': True, 'temporal': True,
+                           'icuData': 'embedded', 'jit': False, 'webAssembly': False,
+                           'experimentalRuntimeFlags': []},
     }
 
 

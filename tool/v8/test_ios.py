@@ -39,7 +39,8 @@ class IOSContractTest(unittest.TestCase):
                          'v8_enable_sandbox = false', 'v8_enable_webassembly = false', 'is_component_build = false',
                          'v8_use_external_startup_data = false', 'v8_monolithic_for_shared_library = false',
                          'ios_enable_code_signing = false', 'use_thin_lto = false',
-                         'treat_warnings_as_errors = false']:
+                         'treat_warnings_as_errors = false', 'v8_enable_i18n_support = true',
+                         'v8_enable_temporal_support = true', 'icu_use_data_file = false']:
                 self.assertIn(flag, args)
             self.assertNotIn('use_system_xcode =', args)
         self.assertNotEqual(ios.output_directory(Path('/source'), 'ios-arm64'), ios.output_directory(Path('/source'), 'ios-simulator-arm64'))
@@ -61,6 +62,12 @@ class IOSContractTest(unittest.TestCase):
         self.assertIn('v8::Script::Compile', ios.LINK_SMOKE)
         self.assertLess(ios.LINK_SMOKE.index('SetFlagsFromString("--jitless")'), ios.LINK_SMOKE.index('InitializePlatform'))
         self.assertNotIn('sv8_', ios.LINK_SMOKE)
+        self.assertIn('InitializeICUDefaultLocation(nullptr)', ios.LINK_SMOKE)
+        self.assertIn('Intl.NumberFormat', ios.LINK_SMOKE)
+        self.assertIn('Intl.Segmenter', ios.LINK_SMOKE)
+        self.assertIn('Temporal.PlainDate.from', ios.LINK_SMOKE)
+        self.assertNotIn('harmony-temporal', ios.LINK_SMOKE)
+        self.assertNotIn('--experimental', ios.LINK_SMOKE)
 
     def test_platform_archive_rejects_host_and_dylib_objects(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -107,6 +114,10 @@ class IOSContractTest(unittest.TestCase):
             self.assertNotIn('CoreFoundation', contract['linkOptions'])
             self.assertIn('system; not bundled', contract['stdlib'])
             self.assertFalse(contract['externalStartupData'])
+            self.assertTrue(contract['featureProfile']['internationalization'])
+            self.assertTrue(contract['featureProfile']['temporal'])
+            self.assertEqual(contract['featureProfile']['icuData'], 'embedded')
+            self.assertEqual(contract['featureProfile']['experimentalRuntimeFlags'], [])
             self.assertNotIn('bridgeArchive', contract)
             self.assertEqual(contract['clangTarget'].endswith('-simulator'), target == 'ios-simulator-arm64')
 
