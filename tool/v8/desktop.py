@@ -49,8 +49,8 @@ def gn_arguments(target, pins):
     args = {
         'is_debug': False, 'is_component_build': False, 'v8_monolithic': True,
         'v8_monolithic_for_shared_library': True, 'v8_use_external_startup_data': False,
-        'use_custom_libcxx': True, 'v8_enable_i18n_support': False,
-        'v8_enable_temporal_support': False, 'use_remoteexec': False,
+        'use_custom_libcxx': True, 'v8_enable_i18n_support': True,
+        'v8_enable_temporal_support': True, 'icu_use_data_file': False, 'use_remoteexec': False,
         'symbol_level': 0, 'target_cpu': cpu, 'v8_target_cpu': cpu,
         'use_thin_lto': False, 'use_cxx23': False,
         'target_os': 'linux' if os_name == 'linux' else 'win',
@@ -267,6 +267,11 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
         'systemLibraries': (['winmm.lib', 'dbghelp.lib', 'advapi32.lib'] if os_name == 'windows' else
                             ['dl', 'm', 'pthread', 'rt']),
         'cxxRuntime': 'pinned Chromium libc++ (__Cr ABI)',
+        'featureProfile': {
+            'internationalization': True, 'temporal': True, 'icuData': 'embedded',
+            'jit': 'upstream-default', 'webAssembly': 'upstream-default',
+            'experimentalRuntimeFlags': [],
+        },
         'crt': 'static MSVC /MT' if os_name == 'windows' else 'system glibc',
     }
     linking['abiCompileOptions'] = abi_options
