@@ -93,6 +93,18 @@ class IOSContractTest(unittest.TestCase):
             path.write_bytes(b'!<arch>\n' + symbols + member[8:])
             self.assertEqual(ios.inspect_static_archive(path, 'ios-arm64')['objectCount'], 1)
 
+    def test_legacy_device_minimum_command_preserves_platform_validation(self):
+        header = struct.pack('<8I', 0xfeedfacf, 0x0100000c, 0, 1, 1, 16, 0, 0)
+        legacy = header + struct.pack('<4I', 0x25, 16, 8 << 16, 27 << 16)
+        self.assertEqual(ios.inspect_macho(legacy, 'ios-arm64')['minIOS'], '8.0.0')
+        with self.assertRaises(ValueError): ios.inspect_macho(legacy, 'ios-simulator-arm64')
+        duplicate = bytearray(legacy)
+        struct.pack_into('<II', duplicate, 16, 2, 32)
+        duplicate += legacy[32:]
+        with self.assertRaises(ValueError): ios.inspect_macho(duplicate, 'ios-arm64')
+        no_version = struct.pack('<8I', 0xfeedfacf, 0x0100000c, 0, 1, 0, 0, 0, 0)
+        with self.assertRaises(ValueError): ios.inspect_macho(no_version, 'ios-arm64')
+
     def test_archive_validation_does_not_require_an_app_bridge(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'lib.a'
@@ -263,6 +275,21 @@ class AppleSDKObjectTest(unittest.TestCase):
                 subprocess.run(['xcrun', 'clang', '-target', triple, '-isysroot', sdk, '-c', str(source), '-o', str(obj)], check=True)
                 subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), str(obj)], check=True)
                 self.assertEqual(ios.inspect_static_archive(archive, target)['platform'], ios.PLATFORMS[target])
+
+    def test_real_legacy_apple_device_object_load_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'probe.c'
+            source.write_text('int probe(void) { return 42; }\n')
+            sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
+            for minimum in ['8.0', '11.0']:
+                obj = root / (minimum + '.o')
+                subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios' + minimum,
+                    '-isysroot', sdk, '-c', str(source), '-o', str(obj)], check=True)
+                commands = subprocess.check_output(['xcrun', 'otool', '-l', str(obj)], text=True)
+                self.assertIn('LC_VERSION_MIN_IPHONEOS', commands)
+                self.assertEqual(ios.inspect_macho(obj.read_bytes(), 'ios-arm64')['minIOS'], minimum + '.0')
+                with self.assertRaises(ValueError): ios.inspect_macho(obj.read_bytes(), 'ios-simulator-arm64')
 
     def test_real_apple_link_resolves_gn_source_archive_dependency(self):
         # Real Apple SDK linking proves archive-path handling, not V8 execution.

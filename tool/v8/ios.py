@@ -130,9 +130,17 @@ def inspect_macho(data, target, filetype=1):
             if size < 24 or build_platform is not None:
                 raise ValueError('Invalid or duplicate LC_BUILD_VERSION')
             build_platform, minimum = struct.unpack_from('<II', data, offset + 8)
+        elif command == 0x25:
+            # Official LLVM emits LC_VERSION_MIN_IPHONEOS for ARM64 device
+            # objects targeting iOS before 12 (including Rust stdlib objects).
+            # ARM64 simulator uses LC_BUILD_VERSION and must not accept this.
+            if size != 16 or build_platform is not None or target != 'ios-arm64':
+                raise ValueError('Invalid, duplicate, or simulator LC_VERSION_MIN_IPHONEOS')
+            build_platform = 2
+            minimum = struct.unpack_from('<I', data, offset + 8)[0]
         offset += size
     if offset != 32 + commands_size or build_platform != PLATFORMS[target]:
-        raise ValueError('Mach-O device/simulator platform does not match target')
+        raise ValueError(f'Mach-O platform {build_platform} does not match {target} ({PLATFORMS[target]})')
     return {'platform': build_platform, 'minIOS': '.'.join(map(str, [minimum >> 16, (minimum >> 8) & 255, minimum & 255]))}
 
 
@@ -160,7 +168,10 @@ def inspect_static_archive(path, target):
             name = member[:length].decode('utf-8').rstrip('\0')
             member = member[length:]
         if name not in ('', '/', '__.SYMDEF', '__.SYMDEF SORTED', '__.SYMDEF_64', '__.SYMDEF_64 SORTED'):
-            inspection = inspect_macho(member, target)
+            try:
+                inspection = inspect_macho(member, target)
+            except ValueError as error:
+                raise ValueError(f'Archive member {name}: {error}') from error
             minima.add(inspection['minIOS'])
             objects += 1
         offset += 60 + size + (size & 1)
