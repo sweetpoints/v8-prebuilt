@@ -14,6 +14,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -342,12 +343,100 @@ def inspect_apple_android_archive(path, target):
     return {'format': 'static-archive', 'objectMachine': expected, 'objectCount': count}
 
 
+
+def sdk_abi_options(source, out, depot, env):
+    flags = gn_property(source, out, depot, env, '//:v8_monolith', 'cflags_cc')
+    names = {'-fexperimental-relative-c++-abi-vtables', '-fno-experimental-relative-c++-abi-vtables'}
+    return [flag for flag in flags if flag in names or flag.removeprefix('/clang:') in names]
+
+
+ANDROID_LINK_PROBE = """#include <v8.h>
+#include <libplatform/libplatform.h>
+extern "C" int v8_sdk_link_test() {
+  const char *version = v8::V8::GetVersion();
+  auto platform = v8::platform::NewDefaultPlatform();
+  v8::V8::InitializePlatform(platform.get());
+  bool initialized = v8::V8::Initialize();
+  if (initialized) v8::V8::Dispose();
+  v8::V8::DisposePlatform();
+  return initialized && version[0] ? 0 : 1;
+}
+"""
+
+
+def inspect_android_consumer(path, target):
+    data = path.read_bytes()
+    if target not in ('android-arm64', 'android-x64') or len(data) < 64 or data[:6] != b'\x7fELF\x02\x01':
+        raise ValueError('Android SDK consumer must be a little-endian ELF64 shared library')
+    kind, machine = struct.unpack_from('<HH', data, 16)
+    expected = 183 if target == 'android-arm64' else 62
+    if kind != 3 or machine != expected:
+        raise ValueError('Android SDK consumer shared-library architecture mismatch')
+    offset = struct.unpack_from('<Q', data, 32)[0]
+    size, count = struct.unpack_from('<HH', data, 54)
+    if size < 56 or count == 0 or offset + size * count > len(data):
+        raise ValueError('Invalid Android SDK consumer ELF program headers')
+    alignments = []
+    for index in range(count):
+        position = offset + index * size
+        if struct.unpack_from('<I', data, position)[0] == 1:
+            alignment = struct.unpack_from('<Q', data, position + 48)[0]
+            if alignment < 16384 or alignment & (alignment - 1):
+                raise ValueError('Android SDK consumer LOAD segments must support 16 KiB pages')
+            alignments.append(alignment)
+    if not alignments:
+        raise ValueError('Android SDK consumer has no LOAD segments')
+    return {'elfMachine': machine, 'loadSegmentAlignments': alignments}
+
+
+def android_link_smoke(source, target, sdk_root, compiler, env):
+    sysroot = source / 'third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot'
+    if not sysroot.is_dir():
+        raise ValueError('Pinned official Android NDK sysroot missing')
+    contract = json.loads((sdk_root / 'linking.json').read_text())
+    probe = sdk_root / 'validation/android-sdk-link.cc'
+    binary = sdk_root / 'validation/libv8_sdk_link_test.so'
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text(ANDROID_LINK_PROBE)
+    command = [compiler, *contract['compileOptions'], '-shared', '-fPIC',
+               '--sysroot=' + str(sysroot), '-fuse-ld=lld', '-Wl,--no-undefined']
+    command += ['-I' + str(sdk_root / name) for name in contract['includeDirs']]
+    command += ['-D' + value for value in contract['defines']]
+    command += [probe, '-o', binary]
+    command += [sdk_root / name for name in contract['libraries']]
+    command += contract['linkOptions']
+    command += ['-l' + value for value in contract['systemLibraries']]
+    run(command, source, env)
+    inspection = inspect_android_consumer(binary, target)
+    report = {'passed': True, 'runtimeExecuted': False, 'binaryInspection': inspection,
+              'binary': 'validation/libv8_sdk_link_test.so', 'binarySha256': sha(binary),
+              'monolithSha256': sha(sdk_root / next(name for name in contract['libraries'] if 'v8_monolith' in name)),
+              'linkingSha256': sha(sdk_root / 'linking.json'),
+              'compilerVersion': run([compiler, '--version'], source, env, capture=True).strip(),
+              'command': [str(argument) for argument in command],
+              'sysrootRequirement': contract.get('sysrootRequirement'),
+              'host': {'os': platform.system(), 'cpu': platform.machine()}}
+    report_path = sdk_root / 'validation/android-link-report.json'
+    report_path.write_text(json.dumps(report, indent=2) + '\n')
+    return report, {'validation/android-sdk-link.cc': probe,
+                    'validation/libv8_sdk_link_test.so': binary,
+                    'validation/android-link-report.json': report_path}
+
+
 def apple_android_profile(source, out, target, pins, defines, depot, env):
     monolith = gn_output(source, out, depot, env, '//:v8_monolith')
     runtime = gn_output(source, out, depot, env, '//sdk_runtime:v8_cxx_runtime')
     libraries = {'lib/' + monolith.name: monolith, 'lib/' + runtime.name: runtime}
     for library in libraries.values():
         inspect_apple_android_archive(library, target)
+    if target.startswith('android-'):
+        architecture = 'aarch64' if target == 'android-arm64' else 'x86_64'
+        builtins = list((source / 'third_party/llvm-build/Release+Asserts/lib/clang').glob(
+            '*/lib/linux/libclang_rt.builtins-' + architecture + '-android.a'))
+        if len(builtins) != 1:
+            raise ValueError('Expected one pinned Android compiler builtins archive')
+        libraries['lib/' + builtins[0].name] = builtins[0]
+        inspect_apple_android_archive(builtins[0], target)
     headers = {}
     for original, prefix in [(source / 'third_party/libc++/src/include', 'runtime/include/c++'),
                              (source / 'third_party/libc++abi/src/include', 'runtime/include/abi')]:
@@ -359,6 +448,12 @@ def apple_android_profile(source, out, target, pins, defines, depot, env):
         site = source / 'buildtools/third_party/libc++/__config_site'
     if not site.is_file():
         raise ValueError('Pinned libc++ configuration header missing')
+    for vendor_headers in (source / 'buildtools/third_party/libc++', out / 'gen/buildtools/third_party/libc++'):
+        for path in vendor_headers.rglob('*'):
+            if path.is_file() and (path.name.startswith('__') or path.suffix in ('.h', '.inc')):
+                headers[(Path('runtime/include/config') / path.relative_to(vendor_headers)).as_posix()] = path
+    if 'runtime/include/config/__assertion_handler' not in headers:
+        raise ValueError('Pinned libc++ vendor assertion header missing')
     headers['runtime/include/config/__config_site'] = site
     options = ['-std=c++20', '-fno-rtti', '-fno-exceptions', '-nostdinc++', '-fPIC']
     link = ['-nostdlib++']
@@ -366,19 +461,25 @@ def apple_android_profile(source, out, target, pins, defines, depot, env):
         triple = ('arm64' if target == 'macos-arm64' else 'x86_64') + '-apple-macos13.0'
         options += ['--target=' + triple, '-mmacosx-version-min=13.0']
         link += ['--target=' + triple, '-mmacosx-version-min=13.0']
+        frameworks = gn_property(source, out, depot, env, '//:v8_monolith', 'frameworks')
+        for framework in frameworks:
+            name = Path(framework).name.removesuffix('.framework')
+            if not re.fullmatch(r'[A-Za-z0-9_]+', name):
+                raise ValueError('Invalid official Apple framework name')
+            link += ['-framework', name]
         systems = ['pthread']
     else:
         triple = ('aarch64' if target == 'android-arm64' else 'x86_64') + '-linux-android26'
         options += ['--target=' + triple]
         link += ['--target=' + triple, '-Wl,-z,max-page-size=16384']
-        systems = ['dl', 'log', 'm', 'pthread']
+        systems = ['dl', 'log', 'm']
     return {'libraries': libraries, 'runtimeHeaders': headers, 'linking': {
         'schemaVersion': 1, 'includeDirs': ['include', 'runtime/include/config', 'runtime/include/c++', 'runtime/include/abi'],
         'defines': defines, 'compileOptions': options, 'libraries': list(libraries),
         'linkOptions': link, 'systemLibraries': systems,
         'compilerStyle': 'clang++', 'cxxRuntime': 'pinned Chromium libc++ (__Cr ABI)',
         'sysrootRequirement': ({'kind': 'apple-macos-sdk', 'minOS': '13.0'} if target.startswith('macos-') else
-                               {'kind': 'android-ndk-sysroot', 'minApi': 26, 'target': triple})}}
+                               {'kind': 'android-ndk', 'minApi': 26, 'target': triple})}}
 
 
 def build(source, depot, env, target, jobs, pins, output_root=None):
@@ -401,6 +502,11 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
     profile = (desktop.sdk_profile(source, out, target, pins, defines, run, depot_command(depot, 'gn'), env)
                if target.startswith(('linux-', 'windows-')) else
                apple_android_profile(source, out, target, pins, defines, depot, env))
+    abi_flags = sdk_abi_options(source, out, depot, env)
+    if profile['linking'].get('compilerStyle') == 'clang-cl':
+        abi_flags = [flag if flag.startswith('/clang:') else '/clang:' + flag for flag in abi_flags]
+    profile['linking']['compileOptions'] += abi_flags
+    profile['linking']['abiCompileOptions'] = list(dict.fromkeys(profile['linking'].get('abiCompileOptions', []) + abi_flags))
     files = sdk_headers(source, out) | profile['libraries'] | profile['runtimeHeaders']
     files |= {'build-inputs/' + path.name: path for path in build_inputs.values()}
     metadata = out / 'sdk-metadata'
@@ -419,6 +525,17 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
              'toolchain': {'clang': run([compiler, '--version'], source, env, capture=True).strip(),
                            'gn': run([depot_command(depot, 'gn'), '--version'], source, env, capture=True).strip()},
              'validation': {'built': True, 'linkTested': False, 'runtimeTested': False}}
+    if target.startswith('android-'):
+        with tempfile.TemporaryDirectory(prefix='v8-sdk-android-consumer-') as temporary:
+            sdk_root = Path(temporary)
+            for name, path in files.items():
+                staged = sdk_root / name
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, staged)
+            report, validation_files = android_link_smoke(source, target, sdk_root, compiler, env)
+            entry['validation']['linkTested'] = True
+            entry['linkSmoke'] = report
+            return publish_sdk(source, target, pins, files | validation_files, entry, output_root)
     return publish_sdk(source, target, pins, files, entry, output_root)
 
 

@@ -166,6 +166,68 @@ class BuildContractTests(unittest.TestCase):
                 self.assertEqual(bootstrap.call_args.args, ((root / 'cache').resolve(), 'macos-x64', pins))
                 self.assertEqual(build.call_args.kwargs, {'output_root': (root / 'artifacts').resolve()})
 
+    def test_mac_profile_includes_vendor_assertion_header_and_actual_frameworks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory); out = source / 'out/sdk'
+            for name in ['third_party/libc++/src/include', 'third_party/libc++abi/src/include', 'buildtools/third_party/libc++']:
+                (source / name).mkdir(parents=True)
+            vendor = source / 'buildtools/third_party/libc++'
+            (vendor / '__config_site').write_text('ABI config')
+            (vendor / '__assertion_handler').write_text('vendor assertion handler')
+            monolith = source / 'libv8_monolith.a'; monolith.write_text('archive')
+            runtime = source / 'libv8_cxx_runtime.a'; runtime.write_text('runtime')
+            with patch.object(builder, 'gn_output', side_effect=[monolith, runtime]), \
+                 patch.object(builder, 'inspect_apple_android_archive'), \
+                 patch.object(builder, 'gn_property', return_value=['Foundation.framework', 'CoreFoundation.framework', 'Security.framework']):
+                profile = builder.apple_android_profile(source, out, 'macos-arm64', builder.read_pins(), [], Path('/depot'), {})
+            self.assertIn('runtime/include/config/__assertion_handler', profile['runtimeHeaders'])
+            self.assertEqual(profile['linking']['linkOptions'][-6:],
+                             ['-framework','Foundation','-framework','CoreFoundation','-framework','Security'])
+
+    def test_sdk_abi_options_keep_actual_relative_vtable_flag(self):
+        with patch.object(builder, 'gn_property', return_value=['-std=c++20', '-fexperimental-relative-c++-abi-vtables', '--sysroot=/private/cache']):
+            self.assertEqual(builder.sdk_abi_options(Path('/v8'), Path('/out'), Path('/depot'), {}),
+                             ['-fexperimental-relative-c++-abi-vtables'])
+
+    def test_android_link_smoke_checks_final_elf_and_binds_sdk_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / 'source'; sdk = root / 'sdk'
+            sysroot = source / 'third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot'
+            sysroot.mkdir(parents=True)
+            sdk.mkdir(); (sdk / 'lib').mkdir()
+            monolith = sdk / 'lib/libv8_monolith.a'; monolith.write_bytes(b'static SDK archive')
+            contract = {'schemaVersion':1, 'includeDirs':['include'], 'defines':['V8_ENABLE_SANDBOX'],
+                        'compileOptions':['-std=c++20', '--target=aarch64-linux-android26'],
+                        'libraries':['lib/libv8_monolith.a'], 'linkOptions':['-nostdlib++', '-Wl,-z,max-page-size=16384'],
+                        'systemLibraries':['dl', 'm'], 'sysrootRequirement':{'kind':'android-ndk'}}
+            (sdk / 'linking.json').write_text(json.dumps(contract))
+            def linked_elf(machine=183, alignment=16384):
+                data = bytearray(120); data[:6] = b'\x7fELF\x02\x01'
+                struct.pack_into('<HH', data, 16, 3, machine)
+                struct.pack_into('<Q', data, 32, 64); struct.pack_into('<HH', data, 54, 56, 1)
+                struct.pack_into('<I', data, 64, 1); struct.pack_into('<Q', data, 112, alignment)
+                return data
+            calls = []
+            def run(arguments, cwd, env=None, capture=False):
+                calls.append(arguments)
+                if '--version' in arguments: return 'pinned Chromium clang'
+                binary = arguments[arguments.index('-o') + 1]
+                binary.write_bytes(linked_elf())
+            with patch.object(builder, 'run', side_effect=run):
+                report, files = builder.android_link_smoke(source, 'android-arm64', sdk, root / 'clang++', {})
+            self.assertTrue(report['passed']); self.assertFalse(report['runtimeExecuted'])
+            self.assertEqual(report['binaryInspection']['loadSegmentAlignments'], [16384])
+            self.assertEqual(report['monolithSha256'], builder.sha(monolith))
+            self.assertEqual(report['linkingSha256'], builder.sha(sdk / 'linking.json'))
+            self.assertEqual(len(files), 3)
+            self.assertIn('-Wl,--no-undefined', calls[0])
+            self.assertIn('--sysroot=' + str(sysroot), calls[0])
+            self.assertNotIn('source_v8', (sdk / 'validation/android-sdk-link.cc').read_text())
+            binary = sdk / 'validation/libv8_sdk_link_test.so'
+            for machine, alignment in [(62,16384), (183,4096)]:
+                binary.write_bytes(linked_elf(machine,alignment))
+                with self.assertRaises(ValueError): builder.inspect_android_consumer(binary, 'android-arm64')
+
     def test_ios_delegate_uses_same_publication_contract(self):
         pins = builder.read_pins()
         with patch.object(builder, 'platform_module') as module:
