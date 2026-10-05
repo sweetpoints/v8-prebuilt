@@ -9,28 +9,33 @@ import desktop
 
 class DesktopTest(unittest.TestCase):
     def pins(self):
-        return {'targets': {target: {'cpu': target.split('-')[1]} for target in desktop.TARGETS}}
+        return {'v8': {'revision': 'a' * 40}, 'targets': {target: {'cpu': target.split('-')[1]} for target in desktop.TARGETS}}
 
-    def binary(self, target):
+    def object(self, target, bigobj=False):
+        data = bytearray(24)
         if target.startswith('linux'):
-            data = bytearray(64)
             data[:6] = b'\x7fELF\x02\x01'
-            struct.pack_into('<HH', data, 16, 3, desktop.MACHINES[target])
+            struct.pack_into('<HH', data, 16, 1, desktop.MACHINES[target])
+        elif bigobj:
+            struct.pack_into('<HHHH', data, 0, 0, 0xFFFF, 2, desktop.MACHINES[target])
         else:
-            data = bytearray(256)
-            data[:2] = b'MZ'
-            struct.pack_into('<I', data, 60, 64)
-            data[64:68] = b'PE\0\0'
-            struct.pack_into('<H', data, 68, desktop.MACHINES[target])
-            struct.pack_into('<HHH', data, 84, 112, 0x2000, 0x20B)
+            struct.pack_into('<H', data, 0, desktop.MACHINES[target])
         return data
 
-    def test_target_configuration_preserves_cpu_and_jit(self):
+    def archive(self, members):
+        data = b'!<arch>\n'
+        for name, member in members:
+            header = f'{name:<16}{0:<12}{0:<6}{0:<6}{644:<8}{len(member):<10}`\n'.encode()
+            data += header + bytes(member) + (b'\n' if len(member) % 2 else b'')
+        return data
+
+    def test_target_configuration_is_relocatable_static_sdk_with_jit(self):
         for target in desktop.TARGETS:
             args = desktop.gn_arguments(target, self.pins())
             self.assertIn('target_cpu = ' + json.dumps(target.split('-')[1]), args)
             self.assertIn('v8_monolithic_for_shared_library = true', args)
             self.assertIn('use_custom_libcxx = true', args)
+            self.assertIn('use_thin_lto = false', args)
             self.assertNotIn('v8_jitless', args)
             self.assertEqual(target.startswith('linux'), 'use_sysroot = true' in args)
         with self.assertRaises(ValueError):
@@ -52,23 +57,31 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual('0', desktop.environment('windows-arm64', env)['DEPOT_TOOLS_WIN_TOOLCHAIN'])
         self.assertEqual({'SAFE': 'retained'}, env)
 
-    def test_architecture_headers_reject_wrong_abi_and_not_dll(self):
+    def test_archive_validates_every_native_member_and_bigobj(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'binary'
+            path = Path(directory) / 'library'
             for target in desktop.TARGETS:
-                data = self.binary(target)
-                path.write_bytes(data)
-                desktop.inspect_binary(path, target)
+                path.write_bytes(self.archive([('/', b'index'), ('member.obj/', self.object(target))]))
+                self.assertEqual(1, desktop.inspect_archive(path, target)['objectCount'])
                 other = target.replace('x64', 'arm64') if target.endswith('x64') else target.replace('arm64', 'x64')
+                path.write_bytes(self.archive([('ok.obj/', self.object(target)), ('wrong.obj/', self.object(other))]))
                 with self.assertRaises(ValueError):
-                    desktop.inspect_binary(path, other)
-            struct.pack_into('<H', data, 86, 0)
-            path.write_bytes(data)
+                    desktop.inspect_archive(path, target)
+            path.write_bytes(self.archive([('big.obj/', self.object('windows-arm64', bigobj=True))]))
+            desktop.inspect_archive(path, 'windows-arm64')
+            data = self.object('windows-arm64', bigobj=True)
+            struct.pack_into('<H', data, 4, 0)
+            path.write_bytes(self.archive([('import.obj/', data)]))
             with self.assertRaises(ValueError):
-                desktop.inspect_binary(path, 'windows-arm64')
-            path.write_bytes(b'MZ')
-            with self.assertRaises(ValueError):
-                desktop.inspect_binary(path, 'windows-arm64')
+                desktop.inspect_archive(path, 'windows-arm64')
+
+    def test_archive_rejects_thin_truncated_empty_and_bitcode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'library'
+            for data in (b'!<thin>\n', b'!<arch>\n', self.archive([('a.o/', self.object('linux-x64'))])[:-1], self.archive([('a.o/', b'BC\xc0\xde')])):
+                path.write_bytes(data)
+                with self.assertRaises(ValueError):
+                    desktop.inspect_archive(path, 'linux-x64')
 
     def test_target_output_isolation_and_explicit_sysroot(self):
         self.assertEqual(4, len({desktop.output_directory(Path('v8'), t) for t in desktop.TARGETS}))
@@ -87,52 +100,45 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(all(call[2] == env for call in calls))
         self.assertEqual('0', env['DEPOT_TOOLS_UPDATE'])
 
-    def test_overlay_exports_and_preserves_bridge_bytes(self):
+    def test_runtime_target_only_archives_upstream_objects(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / 'source_v8').mkdir()
-            header = root / 'source_v8/source_v8.h'
-            header.write_text('unchanged C ABI')
-            inputs = desktop.create_overlay(root)
-            self.assertEqual('unchanged C ABI', header.read_text())
-            self.assertEqual(3, len(inputs))
-            exports = (root / 'source_v8/windows_exports.def').read_text().splitlines()[2:]
-            self.assertEqual(desktop.BRIDGE_EXPORTS, {line.strip() for line in exports})
-            self.assertIn('--no-undefined', inputs['desktop/BUILD.gn'].read_text())
-            with self.assertRaises(ValueError):
-                desktop.create_overlay(root, {'sv8_create'})
+            inputs = desktop.create_runtime_target(Path(directory))
+            text = inputs['sdk_runtime/BUILD.gn'].read_text()
+            self.assertIn('complete_static_lib = true', text)
+            self.assertIn('//buildtools/third_party/libc++', text)
+            self.assertIn('//:v8_monolith', text)
+            self.assertNotIn('sources =', text)
+            self.assertNotIn('source_v8', text)
 
-    def test_validation_checks_exports_runtime_dependencies_and_baseline(self):
+    def test_sdk_profile_uses_actual_gn_outputs_and_matching_runtime_headers(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            path = root / 'library'
-            path.write_bytes(self.binary('linux-x64'))
-            symbols = '\n'.join(name + ' T 0' for name in desktop.BRIDGE_EXPORTS)
-            dynamic = '(NEEDED) Shared library: [libc.so.6]\nName: GLIBC_2.31'
-            def runner(args, *a, **kw):
-                return symbols if 'llvm-nm' in str(args[0]) else dynamic
-            result = desktop.validate_binary(path, root, 'linux-x64', {}, runner)
-            self.assertEqual('2.31', result['maxGlibcVersion'])
-            dynamic = '(NEEDED) Shared library: [libstdc++.so.6]\nName: GLIBC_2.31'
-            with self.assertRaises(ValueError):
-                desktop.validate_binary(path, root, 'linux-x64', {}, runner)
-            dynamic = 'Name: GLIBC_2.34'
-            with self.assertRaises(ValueError):
-                desktop.validate_binary(path, root, 'linux-x64', {}, runner)
-            dynamic = 'Name: GLIBC_2.31'
-            symbols += '\nprivate_extra T 0'
-            with self.assertRaises(ValueError):
-                desktop.validate_binary(path, root, 'linux-x64', {}, runner)
-            path.write_bytes(self.binary('windows-arm64'))
-            def windows_runner(args, *a, **kw):
-                return ('\n'.join('  Name: ' + name for name in desktop.BRIDGE_EXPORTS)
-                        if '--coff-exports' in args else '  Name: KERNEL32.dll')
-            result = desktop.validate_binary(path, root, 'windows-arm64', {}, windows_runner)
-            self.assertEqual(['KERNEL32.dll'], result['dependencies'])
-            def bad_windows_runner(args, *a, **kw):
-                return windows_runner(args, *a, **kw) if '--coff-exports' in args else '  Name: VCRUNTIME140.dll'
-            with self.assertRaises(ValueError):
-                desktop.validate_binary(path, root, 'windows-arm64', {}, bad_windows_runner)
+            source = Path(directory)
+            out = source / 'out/sdk'
+            out.mkdir(parents=True)
+            for target in ('linux-arm64', 'windows-x64'):
+                suffix = '.lib' if target.startswith('windows') else '.a'
+                paths = {}
+                for label, name in (('//:v8_monolith', 'upstream-monolith'), ('//sdk_runtime:v8_cxx_runtime', 'official-runtime')):
+                    path = out / (name + suffix)
+                    path.write_bytes(self.archive([('member.o/', self.object(target))]))
+                    paths[label] = path
+                for directory in ('third_party/libc++/src/include', 'third_party/libc++abi/src/include'):
+                    path = source / directory / 'header'
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text('official-header')
+                config = out / 'gen/buildtools/third_party/libc++/__config_site'
+                config.parent.mkdir(parents=True, exist_ok=True)
+                config.write_text('matching-generated-config')
+                def run(args, *a, **kw):
+                    self.assertIn('--root-target=//sdk_runtime:sdk', args)
+                    return json.dumps({args[3]: {'outputs': ['//' + paths[args[3]].relative_to(source).as_posix()]}})
+                result = desktop.sdk_profile(source, out, target, self.pins(), ['V8_COMPRESS_POINTERS'], run, 'gn', {})
+                self.assertEqual(2, len(result['libraries']))
+                self.assertEqual(config, result['runtimeHeaders']['include/c++/config/__config_site'])
+                self.assertEqual(['V8_COMPRESS_POINTERS'], result['linking']['defines'])
+                self.assertTrue(all(not Path(name).is_absolute() for name in result['linking']['libraries']))
+                self.assertEqual('clang-cl' if target.startswith('windows') else 'clang++', result['linking']['compilerStyle'])
+                self.assertEqual(['lib/' + path.name for path in paths.values()], result['linking']['libraries'])
 
 
 if __name__ == '__main__':
