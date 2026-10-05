@@ -88,6 +88,9 @@ def gn_arguments(target, pins):
         'target_os': 'ios', 'target_cpu': 'arm64', 'v8_target_cpu': 'arm64',
         'target_environment': config['environment'], 'target_platform': 'iphoneos',
         'ios_deployment_target': config['minIOS'], 'ios_enable_code_signing': False,
+        # Pinned ARM64 jitless builtins declare is_code outside its !V8_JITLESS
+        # uses. Keep upstream bytes and warning output; do not promote warnings.
+        'treat_warnings_as_errors': False,
         'is_debug': False, 'is_component_build': False, 'v8_monolithic': True,
         'v8_monolithic_for_shared_library': False, 'v8_use_external_startup_data': False,
         'use_custom_libcxx': False, 'v8_enable_i18n_support': False,

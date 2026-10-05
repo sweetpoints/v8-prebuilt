@@ -38,7 +38,8 @@ class IOSContractTest(unittest.TestCase):
             for flag in ['v8_jitless = true', 'use_custom_libcxx = false', 'v8_enable_pointer_compression = false',
                          'v8_enable_sandbox = false', 'v8_enable_webassembly = false', 'is_component_build = false',
                          'v8_use_external_startup_data = false', 'v8_monolithic_for_shared_library = false',
-                         'ios_enable_code_signing = false', 'use_thin_lto = false']:
+                         'ios_enable_code_signing = false', 'use_thin_lto = false',
+                         'treat_warnings_as_errors = false']:
                 self.assertIn(flag, args)
             self.assertNotIn('use_system_xcode =', args)
         self.assertNotEqual(ios.output_directory(Path('/source'), 'ios-arm64'), ios.output_directory(Path('/source'), 'ios-simulator-arm64'))
