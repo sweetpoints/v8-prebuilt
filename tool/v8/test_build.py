@@ -23,7 +23,33 @@ def elf_fixture(machine=183, alignment=16384):
     return bytes(binary)
 
 
+def mach_fixture(cpu=0x0100000C, minimum=13 << 16):
+    data = bytearray(56)
+    data[:4] = b'\xcf\xfa\xed\xfe'
+    struct.pack_into('<IIIII', data, 4, cpu, 0, 6, 1, 24)
+    struct.pack_into('<IIIIII', data, 32, 0x32, 24, 1, minimum, minimum, 0)
+    return bytes(data)
+
+
 class BuildContractTests(unittest.TestCase):
+
+    def test_macos_macho_and_exports_reject_wrong_cpu_and_deployment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / 'libsource_v8.dylib'
+            for target, cpu in [('macos-arm64', 0x0100000C), ('macos-x64', 0x01000007)]:
+                binary.write_bytes(mach_fixture(cpu))
+                symbols = '\n'.join('_' + name + ' T 0 1' for name in sorted(builder.BRIDGE_EXPORTS))
+                with patch.object(builder, 'run', return_value=symbols):
+                    self.assertEqual(builder.validate_macos_binary(binary, root, target, {})['machCpuType'], cpu)
+                with patch.object(builder, 'run', return_value=symbols + '\n_bad_export T 0 1'):
+                    with self.assertRaisesRegex(ValueError, 'exports differ'):
+                        builder.validate_macos_binary(binary, root, target, {})
+                with self.assertRaisesRegex(ValueError, 'architecture'):
+                    builder.inspect_macos_binary(binary, 'macos-x64' if target == 'macos-arm64' else 'macos-arm64')
+                binary.write_bytes(mach_fixture(cpu, 14 << 16))
+                with self.assertRaisesRegex(ValueError, '13.0'):
+                    builder.inspect_macos_binary(binary, target)
 
     def test_standalone_paths_and_original_bridge_labels(self):
         self.assertEqual(builder.ROOT, Path(__file__).resolve().parents[2])
@@ -87,6 +113,36 @@ class BuildContractTests(unittest.TestCase):
                 self.assertEqual(build.call_args.args, (root / 'source', root / 'depot', {}, 'macos-x64', 2, pins))
                 self.assertEqual(build.call_args.kwargs, {'output_root': (root / 'artifacts').resolve()})
 
+    def test_ios_build_dispatch_receives_explicit_pins_and_output(self):
+        pins = builder.read_pins()
+        with patch.object(builder, 'platform_module') as module:
+            source, depot, output = Path('/source'), Path('/depot'), Path('/artifacts')
+            result = builder.build(source, depot, {}, 'ios-arm64', 2, pins, output)
+            module.assert_called_once_with('ios')
+            module.return_value.build.assert_called_once_with(source, depot, {}, 'ios-arm64', 2, pins, output)
+            self.assertIs(result, module.return_value.build.return_value)
+
+    def test_windows_bootstrap_uses_scoped_environment_and_batch_tools(self):
+        pins = builder.read_pins()
+        desktop = builder.platform_module('desktop')
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            (cache / 'depot_tools-windows').mkdir()
+            def checkout_run(args, cwd, env=None, capture=False):
+                if capture and args[1:4] == ['remote', 'get-url', 'origin']:
+                    return pins['depotTools']['repository']
+                if capture and args[1:3] == ['rev-parse', 'HEAD']:
+                    return pins['v8']['revision']
+            with patch.object(builder, 'require_host'), patch.object(builder, 'run', side_effect=checkout_run) as execute:
+                source, _, env = builder.bootstrap(cache, 'windows-arm64', pins)
+                self.assertEqual(env['DEPOT_TOOLS_WIN_TOOLCHAIN'], '0')
+                self.assertEqual(source.parent.name, 'windows-x64')
+                self.assertEqual(execute.call_args_list[3].args[0][:3], ['cmd.exe', '/d', '/c'])
+            depot = Path(directory)
+            with patch.object(builder.os, 'name', 'nt'):
+                self.assertEqual(builder.depot_command(depot, 'gn').name, 'gn.bat')
+                self.assertEqual(builder.depot_command(depot, 'gclient').name, 'gclient.bat')
+
     def test_pins_are_official_fixed_revisions(self):
         pins = builder.read_pins()
         self.assertEqual(pins['v8']['version'], '15.4.80.24')
@@ -146,7 +202,7 @@ class BuildContractTests(unittest.TestCase):
         self.assertNotIn('mac_deployment_target', args)
         self.assertEqual(builder.read_pins()['targets']['android-x64']['abi'], 'x86_64')
         with self.assertRaisesRegex(ValueError, 'Unsupported V8 target'):
-            builder.gn_arguments('ios-x64')
+            builder.gn_arguments('unknown-target')
 
     def test_android_actual_elf_machine_and_16k_segments_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -210,7 +266,7 @@ class BuildContractTests(unittest.TestCase):
             (dependency / 'NOTICE').write_text('notice')
             output = Path(directory) / 'artifact'
             entries = builder.package_licenses(source, output)
-            self.assertEqual({entry['path'] for entry in entries}, {'licenses/LICENSE', 'licenses/AUTHORS', 'licenses/third_party/example/NOTICE'})
+            self.assertEqual({entry['path'] for entry in entries}, {'licenses/LICENSE', 'licenses/AUTHORS', 'licenses/third_party/example/NOTICE', 'licenses/source_v8/LICENSE'})
             for entry in entries:
                 self.assertEqual(builder.sha(output / entry['path']), entry['sha256'])
 
@@ -238,10 +294,14 @@ class BuildContractTests(unittest.TestCase):
             (source / 'LICENSE').write_text('BSD')
             (source / 'third_party').mkdir()
             out = source / 'out/source_v8'; out.mkdir(parents=True)
-            (out / 'libsource_v8.dylib').write_bytes(b'mac binary')
+            (out / 'libsource_v8.dylib').write_bytes(mach_fixture())
             (out / 'libsource_v8.so').write_bytes(elf_fixture())
             x64out = source / 'out/source_v8_android_x64'; x64out.mkdir(parents=True)
             (x64out / 'libsource_v8.so').write_bytes(elf_fixture(62))
+            macx64out = source / 'out/source_v8_macos_x64'; macx64out.mkdir(parents=True)
+            (macx64out / 'libsource_v8.dylib').write_bytes(mach_fixture(0x01000007))
+            linuxout = source / 'out/source_v8_linux_x64'; linuxout.mkdir(parents=True)
+            (linuxout / 'libsource_v8.so').write_bytes(elf_fixture(62))
             bridge = root / 'bridge'; bridge.mkdir()
             files = {}
             for name in ['source_v8.cpp', 'source_v8.h', 'android_exports.map', 'source_v8.gni']:
@@ -252,6 +312,10 @@ class BuildContractTests(unittest.TestCase):
                     self.assertIn('--root-target=//source_v8:source_v8', args)
                 if not capture:
                     return None
+                if '--version-info' in args:
+                    return '(NEEDED) Shared library: [libc.so.6]\nName: GLIBC_2.31'
+                if '--extern-only' in args:
+                    return '\n'.join('_' + name + ' T 0 1' for name in sorted(builder.BRIDGE_EXPORTS))
                 if '--dynamic' in args:
                     return '\n'.join(name + ' T 0 1' for name in sorted(builder.BRIDGE_EXPORTS))
                 if 'revinfo' in args:
@@ -270,9 +334,11 @@ class BuildContractTests(unittest.TestCase):
                 linux_notice.unlink()
                 builder.build(source, root / 'depot', {}, 'android-x64', 1, pins)
                 builder.build(source, root / 'depot', {}, 'macos-arm64', 1, pins)
+                builder.build(source, root / 'depot', {}, 'macos-x64', 1, pins)
+                builder.build(source, root / 'depot', {}, 'linux-x64', 1, pins)
                 artifact = package / pins['v8']['revision']
                 manifest = __import__('json').loads((artifact / 'manifest.json').read_text())
-                self.assertEqual(set(manifest['targets']), {'android-arm64', 'android-x64', 'macos-arm64'})
+                self.assertEqual(set(manifest['targets']), {'android-arm64', 'android-x64', 'macos-arm64', 'macos-x64', 'linux-x64'})
                 self.assertEqual(manifest['targets']['android-x64']['abi'], 'x86_64')
                 self.assertEqual(manifest['targets']['android-x64']['binaryInspection']['elfMachine'], 62)
                 self.assertEqual(manifest['targets']['android-arm64']['binaryInspection']['elfMachine'], 183)
@@ -287,11 +353,15 @@ class BuildContractTests(unittest.TestCase):
                     self.assertEqual(builder.sha(artifact / target['binary']), target['sha256'])
                     self.assertEqual(builder.sha(artifact / target['header']), target['headerSha256'])
                     self.assertEqual(target['artifactKind'], 'shared-bridge')
+                    self.assertEqual(len(target['targetFiles']), 8 if 'platformBuildInputSha256' in target else 5)
+                    for item in target['targetFiles']:
+                        self.assertEqual(builder.sha(artifact / item['path']), item['sha256'])
+                        self.assertNotIn('\\', item['path'])
                     self.assertFalse(target['validation']['runtimeTested'])
                     self.assertFalse(target['validation']['sourceCompatibilityTested'])
                 old = (artifact / 'macos-arm64/libsource_v8.dylib').read_bytes()
                 files['source_v8.cpp'].write_text('changed bridge')
-                (out / 'libsource_v8.dylib').write_bytes(b'new binary')
+                (out / 'libsource_v8.dylib').write_bytes(mach_fixture())
                 with self.assertRaisesRegex(ValueError, 'provenance differs'):
                     builder.build(source, root / 'depot', {}, 'macos-arm64', 1, pins)
                 self.assertEqual((artifact / 'macos-arm64/libsource_v8.dylib').read_bytes(), old)

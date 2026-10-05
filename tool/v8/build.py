@@ -3,6 +3,8 @@
 import argparse
 from contextlib import contextmanager
 import hashlib
+import importlib.util
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -17,7 +19,9 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 DEFAULT_CACHE_ROOT = ROOT / '.cache/v8-source'
 DEFAULT_OUTPUT_ROOT = ROOT / 'artifacts'
-TARGETS = ('macos-arm64', 'macos-x64', 'android-arm64', 'android-x64')
+TARGETS = ('macos-arm64', 'macos-x64', 'android-arm64', 'android-x64',
+           'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64',
+           'ios-arm64', 'ios-simulator-arm64')
 BRIDGE_EXPORTS = {'sv8_create', 'sv8_start', 'sv8_poll', 'sv8_resolve',
                   'sv8_sync_poll', 'sv8_sync_reply', 'sv8_cancel', 'sv8_destroy',
                   'sv8_free', 'sv8_version'}
@@ -102,9 +106,25 @@ def bridge_digest(files=None):
     return digest.hexdigest()
 
 
+@lru_cache(maxsize=None)
+def platform_module(name):
+    spec = importlib.util.spec_from_file_location('source_v8_' + name, HERE / (name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def depot_command(depot, name):
+    return depot / (name + ('.bat' if os.name == 'nt' else ''))
+
+
 def require_host(target):
     if target not in TARGETS:
         raise ValueError('Unsupported V8 target: ' + target)
+    if target.startswith(('linux-', 'windows-')):
+        return platform_module('desktop').require_host(target)
+    if target.startswith('ios-'):
+        return platform_module('ios').require_host(target)
     host = (platform.system(), platform.machine())
     expected = (('Darwin', 'arm64' if target == 'macos-arm64' else 'x86_64')
                 if target.startswith('macos-') else ('Linux', 'x86_64'))
@@ -124,7 +144,9 @@ def initialize_depot(depot, env):
 def bootstrap(cache, target, pins):
     require_host(target)
     cache.mkdir(parents=True, exist_ok=True)
-    depot = cache / ('depot_tools' if target.startswith('macos-') else 'depot_tools-linux-x86_64')
+    depot = cache / ('depot_tools' if target.startswith(('macos-', 'ios-'))
+                     else 'depot_tools-windows' if target.startswith('windows-')
+                     else 'depot_tools-linux-x86_64')
     if not depot.exists():
         run(['git', 'clone', '--depth', '1', pins['depotTools']['repository'], depot], cache)
     origin = run(['git', 'remote', 'get-url', 'origin'], depot, capture=True).strip()
@@ -133,17 +155,27 @@ def bootstrap(cache, target, pins):
     run(['git', 'fetch', '--depth', '1', 'origin', pins['depotTools']['revision']], depot)
     run(['git', 'checkout', '--detach', pins['depotTools']['revision']], depot)
     env = dict(os.environ, PATH=str(depot) + os.pathsep + os.environ['PATH'], DEPOT_TOOLS_UPDATE='0')
-    initialize_depot(depot, env)
+    if target.startswith(('linux-', 'windows-')):
+        env = platform_module('desktop').environment(target, env)
+    if target.startswith('windows-'):
+        platform_module('desktop').initialize_depot_windows(depot, env, run)
+    else:
+        initialize_depot(depot, env)
     # Android ABIs share the fixed Linux-host DEPS checkout but have independent
     # GN output directories, so x64 cannot replace ARM64 objects or binaries.
-    workspace_target = 'android-arm64' if target.startswith('android-') else target
+    workspace_target = ('android-arm64' if target.startswith('android-') else
+                        'ios-arm64' if target.startswith('ios-') else
+                        'linux-x64' if target.startswith('linux-') else
+                        'windows-x64' if target.startswith('windows-') else target)
     workspace = cache / pins['v8']['revision'] / workspace_target
     workspace.mkdir(parents=True, exist_ok=True)
     gclient = 'solutions = ' + repr([{'name': 'v8', 'url': pins['v8']['repository'] + '@' + pins['v8']['revision'], 'deps_file': 'DEPS', 'managed': False, 'custom_deps': {}, 'custom_vars': {}}]) + '\n'
     if target.startswith('android-'):
         gclient += "target_os = ['android']\n"
+    elif target.startswith('ios-'):
+        gclient += "target_os = ['ios']\n"
     (workspace / '.gclient').write_text(gclient)
-    run([depot / 'gclient', 'sync', '--no-history', '--shallow', '--revision', 'v8@' + pins['v8']['revision']], workspace, env)
+    run([depot_command(depot, 'gclient'), 'sync', '--no-history', '--shallow', '--revision', 'v8@' + pins['v8']['revision']], workspace, env)
     source = workspace / 'v8'
     actual = run(['git', 'rev-parse', 'HEAD'], source, capture=True).strip()
     if actual != pins['v8']['revision']:
@@ -154,7 +186,12 @@ def bootstrap(cache, target, pins):
 def gn_arguments(target, pins=None):
     if target not in TARGETS:
         raise ValueError('Unsupported V8 target: ' + target)
-    cpu = (read_pins() if pins is None else pins)['targets'][target]['cpu']
+    pins = read_pins() if pins is None else pins
+    if target.startswith(('linux-', 'windows-')):
+        return platform_module('desktop').gn_arguments(target, pins)
+    if target.startswith('ios-'):
+        return platform_module('ios').gn_arguments(target, pins)
+    cpu = pins['targets'][target]['cpu']
     args = {'is_debug': False, 'is_component_build': False, 'v8_monolithic': True,
             'v8_monolithic_for_shared_library': True, 'v8_use_external_startup_data': False,
             'use_custom_libcxx': True, 'v8_enable_i18n_support': False,
@@ -210,6 +247,51 @@ def validate_android_binary(path, source, target, env):
     return inspection
 
 
+
+def inspect_macos_binary(path, target):
+    data = path.read_bytes()
+    if target not in ('macos-arm64', 'macos-x64') or len(data) < 32 or data[:4] != b'\xcf\xfa\xed\xfe':
+        raise ValueError('macOS bridge must be a thin little-endian Mach-O 64 dylib')
+    cpu, _, kind, count, command_bytes = struct.unpack_from('<IIIII', data, 4)
+    expected = 0x0100000C if target == 'macos-arm64' else 0x01000007
+    if cpu != expected or kind != 6:
+        raise ValueError('macOS Mach-O architecture or dylib type mismatch')
+    if 32 + command_bytes > len(data):
+        raise ValueError('Invalid macOS Mach-O load commands')
+    position = 32
+    minimum = None
+    for _ in range(count):
+        if position + 8 > 32 + command_bytes:
+            raise ValueError('Invalid macOS Mach-O load command')
+        command, size = struct.unpack_from('<II', data, position)
+        if size < 8 or position + size > 32 + command_bytes:
+            raise ValueError('Invalid macOS Mach-O load command size')
+        if command == 0x32:
+            if size < 24 or struct.unpack_from('<I', data, position + 8)[0] != 1:
+                raise ValueError('Mach-O build platform must be macOS')
+            minimum = struct.unpack_from('<I', data, position + 12)[0]
+        elif command == 0x24:
+            if size < 16:
+                raise ValueError('Invalid macOS minimum version command')
+            minimum = struct.unpack_from('<I', data, position + 8)[0]
+        position += size
+    if minimum != (13 << 16):
+        raise ValueError('macOS bridge minimum deployment must match pinned 13.0')
+    return {'machCpuType': cpu, 'minMacOS': '13.0'}
+
+
+def validate_macos_binary(path, source, target, env):
+    inspection = inspect_macos_binary(path, target)
+    tools = source / 'third_party/llvm-build/Release+Asserts/bin'
+    symbols = run([tools / 'llvm-nm', '--extern-only', '--defined-only', '--format=posix', path],
+                  source, env, capture=True)
+    exports = {line.split()[0].removeprefix('_') for line in symbols.splitlines() if line.strip()}
+    if exports != BRIDGE_EXPORTS:
+        raise ValueError('macOS bridge exports differ from the sv8 C ABI')
+    inspection['exports'] = sorted(exports)
+    return inspection
+
+
 def source_version(source):
     header = (source / 'include/v8-version.h').read_text()
     names = ['V8_MAJOR_VERSION', 'V8_MINOR_VERSION', 'V8_BUILD_NUMBER', 'V8_PATCH_LEVEL']
@@ -227,12 +309,19 @@ def package_licenses(source, destination, existing=()):
         if not path.is_file() or '.git' in path.parts:
             continue
         relative = Path('licenses') / path.relative_to(source)
-        label = str(relative)
+        label = relative.as_posix()
         digest = sha(path)
         if label in entries and entries[label]['sha256'] != digest:
             raise ValueError(f'License provenance conflict at {label}')
         entries[label] = {'path': label, 'sha256': digest}
         copies.append((path, destination / relative))
+    bridge_license = ROOT / 'LICENSE'
+    bridge_label = 'licenses/source_v8/LICENSE'
+    bridge_hash = sha(bridge_license)
+    if bridge_label in entries and entries[bridge_label]['sha256'] != bridge_hash:
+        raise ValueError('License provenance conflict at ' + bridge_label)
+    entries[bridge_label] = {'path': bridge_label, 'sha256': bridge_hash}
+    copies.append((bridge_license, destination / bridge_label))
     # Preflight all conflicts before replacing any indexed license file.
     for path, output in copies:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -241,6 +330,12 @@ def package_licenses(source, destination, existing=()):
 
 
 def build(source, depot, env, target, jobs, pins, output_root=None):
+    if target.startswith('ios-'):
+        return platform_module('ios').build(source, depot, env, target, jobs, pins, output_root)
+    desktop = platform_module('desktop') if target.startswith(('linux-', 'windows-')) else None
+    if desktop is not None:
+        env = desktop.environment(target, env)
+        desktop.prepare(source, depot, env, target, run)
     if source_version(source) != pins['v8']['version']:
         raise ValueError('Official source version differs from pins')
     compiled_bridge_digest = bridge_digest()
@@ -251,24 +346,35 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
     copied_files = {label: overlay / path.name for label, path in bridge_files().items()}
     if bridge_digest(copied_files) != compiled_bridge_digest:
         raise ValueError('Bridge source changed while copying build overlay')
-    (overlay / 'BUILD.gn').write_text('import("//source_v8/source_v8.gni")\nsource_v8_library("source_v8") {}\n')
+    platform_inputs = {}
+    if desktop is not None:
+        platform_inputs = desktop.create_overlay(source, BRIDGE_EXPORTS)
+    else:
+        (overlay / 'BUILD.gn').write_text('import("//source_v8/source_v8.gni")\nsource_v8_library("source_v8") {}\n')
+    platform_digest = bridge_digest(platform_inputs) if platform_inputs else None
     out = source / ({'android-x64': 'out/source_v8_android_x64',
                      'macos-x64': 'out/source_v8_macos_x64'}.get(target, 'out/source_v8'))
+    if desktop is not None:
+        out = desktop.output_directory(source, target)
     out.mkdir(parents=True, exist_ok=True)
     args = gn_arguments(target, pins)
     (out / 'args.gn').write_text(args)
-    run([depot / 'gn', 'gen', out, '--root-target=//source_v8:source_v8', '--fail-on-unused-args'], source, env)
-    run([depot / 'autoninja', '-C', out, '-j', jobs, 'source_v8:source_v8'], source, env)
+    run([depot_command(depot, 'gn'), 'gen', out, '--root-target=//source_v8:source_v8', '--fail-on-unused-args'], source, env)
+    run([depot_command(depot, 'autoninja'), '-C', out, '-j', jobs, 'source_v8:source_v8'], source, env)
     suffix = '.dylib' if target.startswith('macos-') else '.so'
-    built = out / ('libsource_v8' + suffix)
+    built = out / (desktop.binary_name(target) if desktop is not None else 'libsource_v8' + suffix)
     if not built.is_file():
         raise ValueError('Shared bridge output missing')
-    inspection = validate_android_binary(built, source, target, env) if target.startswith('android-') else None
+    inspection = (desktop.validate_binary(built, source, target, env, run) if desktop is not None else
+                  validate_android_binary(built, source, target, env) if target.startswith('android-') else
+                  validate_macos_binary(built, source, target, env))
     artifact = Path(DEFAULT_OUTPUT_ROOT if output_root is None else output_root) / pins['v8']['revision']
     artifact.mkdir(parents=True, exist_ok=True)
     with publication_lock(artifact / '.publish.lock'):
         if bridge_digest() != compiled_bridge_digest or bridge_digest(copied_files) != compiled_bridge_digest:
             raise ValueError('Bridge source or compiled overlay changed during build; refusing publication')
+        if platform_digest is not None and bridge_digest(platform_inputs) != platform_digest:
+            raise ValueError('Platform overlay changed during build; refusing publication')
         manifest_path = artifact / 'manifest.json'
         previous = None
         if manifest_path.exists():
@@ -287,31 +393,51 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
         header.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(overlay / 'source_v8.h', header)
         (destination / 'args.gn').write_text(args)
-        revinfo = run([depot / 'gclient', 'revinfo', '--actual'], source.parent, env, capture=True)
+        revinfo = run([depot_command(depot, 'gclient'), 'revinfo', '--actual'], source.parent, env, capture=True)
         (destination / 'dependencies.txt').write_text(revinfo)
-        defines = run([depot / 'gn', 'desc', out, '//source_v8:source_v8', 'defines', '--format=json',
+        defines = run([depot_command(depot, 'gn'), 'desc', out, '//source_v8:source_v8', 'defines', '--format=json',
                        '--root-target=//source_v8:source_v8'], source, env, capture=True)
         (destination / 'defines.json').write_text(defines)
-        clang = source / 'third_party/llvm-build/Release+Asserts/bin/clang++'
+        clang = source / ('third_party/llvm-build/Release+Asserts/bin/clang-cl.exe'
+                          if target.startswith('windows-') else
+                          'third_party/llvm-build/Release+Asserts/bin/clang++')
         toolchain = {'clang': run([clang, '--version'], source, env, capture=True).strip(),
-                     'gn': run([depot / 'gn', '--version'], source, env, capture=True).strip()}
+                     'gn': run([depot_command(depot, 'gn'), '--version'], source, env, capture=True).strip()}
         if target.startswith('macos-'):
             toolchain['appleLinker'] = run(['xcrun', 'ld', '-v'], source, env, capture=True).strip()
             toolchain['xcode'] = run(['xcodebuild', '-version'], source, env, capture=True).strip()
             toolchain['macSdk'] = run(['xcrun', '--sdk', 'macosx', '--show-sdk-version'], source, env, capture=True).strip()
-        entry = {'artifactKind': 'shared-bridge', 'binary': str(Path(target) / binary.name), 'sha256': sha(binary), 'size': binary.stat().st_size,
-                 'header': str(Path(target) / 'include/source_v8.h'), 'headerSha256': sha(header),
+        entry = {'artifactKind': 'shared-bridge', 'binary': (Path(target) / binary.name).as_posix(), 'sha256': sha(binary), 'size': binary.stat().st_size,
+                 'header': (Path(target) / 'include/source_v8.h').as_posix(), 'headerSha256': sha(header),
                  'host': {'os': platform.system(), 'cpu': platform.machine()},
                  'gnArgs': args, 'gnArgsSha256': sha(destination / 'args.gn'),
                  'depsSha256': sha(source / 'DEPS'), 'dependencyInventorySha256': sha(destination / 'dependencies.txt'),
                  'definesSha256': sha(destination / 'defines.json'), 'toolchain': toolchain,
                  'validation': {'built': True, 'runtimeTested': False, 'sourceCompatibilityTested': False}}
+        if platform_digest is not None:
+            entry['platformBuildInputSha256'] = platform_digest
+            entry['platformBuildInputs'] = []
+            for label, path in sorted(platform_inputs.items()):
+                relative = Path(target) / 'build-inputs' / Path(label).name
+                destination_input = artifact / relative
+                destination_input.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, destination_input)
+                entry['platformBuildInputs'].append({'path': relative.as_posix(), 'sha256': sha(destination_input), 'label': label})
         if target.startswith('macos-'):
             entry['minMacOS'] = '13.0'
-        else:
+            entry['binaryInspection'] = inspection
+        elif target.startswith('android-'):
             entry['minApi'] = pins['targets'][target]['minApi']
             entry['abi'] = pins['targets'][target]['abi']
             entry['binaryInspection'] = inspection
+        else:
+            entry['binaryInspection'] = inspection
+        produced = [binary, header, destination / 'args.gn', destination / 'dependencies.txt',
+                    destination / 'defines.json']
+        produced += [artifact / item['path'] for item in entry.get('platformBuildInputs', [])]
+        entry['targetFiles'] = [{'path': path.relative_to(artifact).as_posix(),
+                                 'sha256': sha(path), 'size': path.stat().st_size}
+                                for path in sorted(produced)]
         manifest = {'schemaVersion': 1, 'v8': pins['v8'], 'depotTools': pins['depotTools'],
                     'bridge': {'abi': 1, 'sourceSha256': compiled_bridge_digest}, 'targets': {}}
         if previous is not None:
