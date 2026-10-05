@@ -401,7 +401,7 @@ def inspect_apple_android_archive(path, target):
 
 
 def archive_members(path):
-    """Yield native/archive metadata members, resolving GNU and BSD names."""
+    """Yield native/archive metadata members, resolving GNU, COFF and BSD names."""
     with path.open('rb') as archive:
         if archive.read(8) != b'!<arch>\n':
             raise ValueError('Rust SDK input must be a complete archive: ' + str(path))
@@ -431,9 +431,12 @@ def archive_members(path):
                 payload = payload[length:]
             elif re.fullmatch(r'/[0-9]+', name):
                 offset = int(name[1:])
-                end = names.find(b'/\n', offset)
+                # Microsoft COFF longnames are NUL terminated; GNU names
+                # terminate with slash-newline. Rust emits both formats.
+                terminator = b'\0' if b'\0' in names else b'/\n'
+                end = names.find(terminator, offset)
                 if offset >= len(names) or end < 0:
-                    raise ValueError('Invalid Rust GNU member name')
+                    raise ValueError('Invalid Rust extended archive member name')
                 name = names[offset:end].decode('utf-8')
             else:
                 name = name.removesuffix('/')

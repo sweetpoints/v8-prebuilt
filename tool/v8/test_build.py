@@ -424,6 +424,20 @@ class RustSdkTests(unittest.TestCase):
             path.write_bytes(self.ar([('#1/11', name + obj)]))
             self.assertEqual(list(builder.archive_members(path)), [('duplicate.o', obj)])
 
+    def test_coff_longnames_resolve_metadata_and_native_members(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fixture.rlib'; obj = self.object('windows-x64')
+            metadata = b'long_member_name.rmeta\0'; native = b'long_native_member.obj\0'
+            path.write_bytes(self.ar([('/', b'first linker'), ('/', b'second linker'),
+                                      ('//', metadata + native), ('/0', b'metadata'),
+                                      ('/' + str(len(metadata)), obj)]))
+            self.assertEqual(list(builder.archive_members(path)),
+                             [('long_member_name.rmeta', b'metadata'), ('long_native_member.obj', obj)])
+            for table, offset in ((native[:-1], 0), (native, len(native)), (native, 999)):
+                path.write_bytes(self.ar([('//', table), ('/' + str(offset), obj)]))
+                with self.assertRaisesRegex(ValueError, 'extended archive member name'):
+                    list(builder.archive_members(path))
+
     def test_rust_runtime_merges_all_unique_objects_and_omits_metadata(self):
         for target in ('macos-arm64','linux-x64','windows-arm64'):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
@@ -488,7 +502,7 @@ class RustSdkTests(unittest.TestCase):
                     metadata=crate/'verylongmetadata.rmeta';metadata.write_bytes(b'opaque Rust metadata')
                     archive=out/'obj'/name
                     archive.unlink(missing_ok=True)
-                    execute([ar,'--format=gnu','rcs',archive,obj,metadata],source)
+                    execute([ar,'--format=' + ('coff' if target.startswith('windows-') else 'gnu'),'rcs',archive,obj,metadata],source)
                     inputs.append(archive)
                 (out/'obj/v8_monolith.ninja').write_text('  rlibs = obj/libtemporal_capi_lib.rlib obj/libstd_std.rlib\n')
                 with patch.object(builder,'run',side_effect=execute):
