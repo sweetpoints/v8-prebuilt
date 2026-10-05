@@ -53,10 +53,26 @@ branch rather than the highest V8 development tag. Its JSON includes `version`,
 release with matching provenance avoids rebuilding; conflicting or incomplete
 published provenance fails instead of silently replacing a release.
 
+The [release workflow](.github/workflows/release.yml) schedules detection every
+six hours, at minute 17 (UTC). It can also be started manually:
+
+```sh
+gh workflow run release.yml --repo sweetpoints/v8-prebuilt
+```
+
+All ten builds use the same uploaded `stable-pins.json`. The publication job
+depends on the complete build matrix and Linux ARM64 native smoke job. Desktop
+smoke checks run on the matching supported host; Android and iOS build outputs
+do not by themselves claim device execution. The workflow is implemented, but
+its implementation is not evidence that a remote run has already succeeded.
+
 The detector does not change checked-in pins or commit to the repository. The
 workflow creates a resolved pin file for that run; every matrix build consumes
 the same file through `--pins-file`. The run's resolved file is included in the
-release. `GH_TOKEN` or `GITHUB_TOKEN`, when available, is used for release lookup.
+release. HTTP, Git or malformed-metadata failures stop detection with exit code 1;
+they do not produce a successful build decision. For Actions, pass
+`--github-output "$GITHUB_OUTPUT"` to append version/revision/tag/should_build
+outputs. `GH_TOKEN` or `GITHUB_TOKEN`, when available, is used for release lookup.
 
 ## Build locally
 
@@ -70,8 +86,16 @@ python3 tool/v8/build.py build --target macos-arm64 \
   --pins-file tool/v8/pins.json --jobs 6
 ```
 
-Use the resolved pin file from stable detection's workflow when reproducing that
-release. `--cache-root` chooses the V8/depot_tools checkout cache; `--output-root`
+Create a local resolved pin file from the detector's JSON if reproducing the
+currently detected stable source:
+
+```sh
+python3 tool/release_pins.py --detection artifacts/stable.json \
+  --output artifacts/resolved-pins.json
+```
+
+Use that file with `--pins-file`, or use the exact resolved `pins.json` downloaded
+from the release being reproduced. `--cache-root` chooses the V8/depot_tools checkout cache; `--output-root`
 chooses the output base, beneath which the full V8 revision identifies artifacts.
 Output includes `manifest.json`, target libraries and recorded build inputs.
 
