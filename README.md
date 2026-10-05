@@ -37,6 +37,56 @@ artifact's manifest. macOS applications adopting Hardened Runtime need the JIT
 entitlement when using the JIT build; packaging a library does not configure a
 consumer's app signing or entitlements.
 
+## Detect the stable source
+
+```sh
+python3 tool/detect_stable.py --repository sweetpoints/v8-prebuilt \
+  --output artifacts/stable.json
+```
+
+Detection uses ChromiumDash's Linux Stable channel to find the stable milestone,
+resolves that milestone's official V8 branch head, and reads `v8-version.h` at
+the full resolved revision. It requires a non-candidate version and checks that
+the stable milestone did not change during resolution. This follows the stable
+branch rather than the highest V8 development tag. Its JSON includes `version`,
+`revision`, `branch`, `tag`, `should_build` and release status. An existing complete
+release with matching provenance avoids rebuilding; conflicting or incomplete
+published provenance fails instead of silently replacing a release.
+
+The detector does not change checked-in pins or commit to the repository. The
+workflow creates a resolved pin file for that run; every matrix build consumes
+the same file through `--pins-file`. The run's resolved file is included in the
+release. `GH_TOKEN` or `GITHUB_TOKEN`, when available, is used for release lookup.
+
+## Build locally
+
+The unified producer entry point accepts a selected target and an explicit pin
+file. For example, on a compatible macOS host:
+
+```sh
+python3 tool/v8/build.py bootstrap --target macos-arm64 \
+  --pins-file tool/v8/pins.json
+python3 tool/v8/build.py build --target macos-arm64 \
+  --pins-file tool/v8/pins.json --jobs 6
+```
+
+Use the resolved pin file from stable detection's workflow when reproducing that
+release. `--cache-root` chooses the V8/depot_tools checkout cache; `--output-root`
+chooses the output base, beneath which the full V8 revision identifies artifacts.
+Output includes `manifest.json`, target libraries and recorded build inputs.
+
+macOS targets require the matching native host CPU: Darwin ARM64 for
+`macos-arm64` and Darwin x86_64 for `macos-x64`, with minimum macOS 13.0.
+Android targets require API 26 or later and build on Linux x86_64. Linux x64 and ARM64 also build on Linux
+x86_64, with the pinned official compiler and Debian Bullseye target sysroot;
+Linux binaries are checked against the GLIBC 2.31 baseline. Linux ARM64 build
+success is separate from native ARM64 execution. Windows uses an installed Visual
+Studio toolchain with `DEPOT_TOOLS_WIN_TOOLCHAIN=0`, official clang and a static
+CRT; the CI runner version is not a promise of a minimum Windows version.
+iOS requires a full Xcode installation on Darwin ARM64, produces static SDK
+archives, and disables JIT and WebAssembly. Desktop and Android outputs are
+`libsource_v8.so`, `libsource_v8.dylib` or `source_v8.dll` as appropriate.
+
 ## Download a released target
 
 Release archives use `v8-<version>-<target>.tar.gz`. Each archive contains its
@@ -81,6 +131,9 @@ actual host/toolchain identity and hashes of GN arguments, DEPS, dependency
 inventory and build definitions. The bridge source hash and C ABI version are
 part of the artifact manifest. A consumer must validate both upstream and bridge
 identity, target, minimum OS/API, binary size and SHA-256.
+
+Current build definitions disable Intl and Temporal and embed startup data in the
+library. These SDKs are not a promise of every V8 optional feature.
 
 The builder compiles the C ABI bridge within the V8 GN graph. Consumers call the
 C interface in `src/source_v8.h`; they do not link an independently compiled C++
