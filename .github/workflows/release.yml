@@ -1,0 +1,148 @@
+name: Official V8 stable SDK release
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: official-v8-stable-release
+  cancel-in-progress: false
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    outputs:
+      should_build: ${{ steps.stable.outputs.should_build }}
+      version: ${{ steps.stable.outputs.version }}
+      revision: ${{ steps.stable.outputs.revision }}
+      tag: ${{ steps.stable.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Detect official stable V8 source
+        id: stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tool/detect_stable.py --repository "$GITHUB_REPOSITORY" --output detection.json --github-output "$GITHUB_OUTPUT"
+      - name: Freeze this build's source pins
+        if: steps.stable.outputs.should_build == 'true'
+        run: python tool/release_pins.py --detection detection.json --output stable-pins.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.stable.outputs.should_build == 'true'
+        with:
+          name: stable-pins
+          path: stable-pins.json
+          if-no-files-found: error
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: android-arm64, runner: ubuntu-24.04, jobs: 4, python_arch: x64}
+          - {target: android-x64, runner: ubuntu-24.04, jobs: 4, python_arch: x64}
+          - {target: ios-arm64, runner: macos-15, jobs: 2, python_arch: arm64}
+          - {target: ios-simulator-arm64, runner: macos-15, jobs: 2, python_arch: arm64}
+          - {target: macos-arm64, runner: macos-15, jobs: 2, python_arch: arm64}
+          - {target: macos-x64, runner: macos-15-intel, jobs: 4, python_arch: x64}
+          - {target: linux-x64, runner: ubuntu-24.04, jobs: 4, python_arch: x64}
+          - {target: linux-arm64, runner: ubuntu-24.04, jobs: 4, python_arch: x64}
+          - {target: windows-x64, runner: windows-2025, jobs: 4, python_arch: x64}
+          - {target: windows-arm64, runner: windows-11-arm, jobs: 4, python_arch: arm64}
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEPOT_TOOLS_UPDATE: '0'
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.python_arch }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: stable-pins
+      - name: Free unused Linux hosted image payloads
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h .
+      - name: Select short Windows source cache path
+        if: runner.os == 'Windows'
+        run: echo 'V8_CACHE_ROOT=C:/v8cache' >> "$GITHUB_ENV"
+      - name: Select source cache path
+        if: runner.os != 'Windows'
+        run: echo "V8_CACHE_ROOT=$GITHUB_WORKSPACE/.cache/v8-source" >> "$GITHUB_ENV"
+      - name: Fetch fixed official source and DEPS
+        run: python tool/v8/build.py bootstrap --target '${{ matrix.target }}' --pins-file stable-pins.json --cache-root "$V8_CACHE_ROOT"
+      - name: Install official Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          source_root=$(python -c 'import pathlib; print(next(pathlib.Path(".cache/v8-source").rglob("build/install-build-deps.sh")))')
+          sudo "$source_root" --no-prompt
+      - name: Build the native SDK
+        run: python tool/v8/build.py build --target '${{ matrix.target }}' --pins-file stable-pins.json --cache-root "$V8_CACHE_ROOT" --output-root artifacts --jobs '${{ matrix.jobs }}'
+      - name: Execute native desktop C ABI cases
+        if: startsWith(matrix.target, 'macos-') || matrix.target == 'linux-x64' || startsWith(matrix.target, 'windows-')
+        run: |
+          library=$(python -c 'import json,pathlib; m=json.loads(pathlib.Path("artifacts/${{ needs.detect.outputs.revision }}/manifest.json").read_text()); print(pathlib.Path("artifacts/${{ needs.detect.outputs.revision }}")/m["targets"]["${{ matrix.target }}"]["binary"])')
+          python tool/smoke.py --library "$library" --expected-version '${{ needs.detect.outputs.version }}' --output 'artifacts/${{ needs.detect.outputs.revision }}/${{ matrix.target }}/runtime-smoke.json'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: v8-${{ matrix.target }}
+          path: artifacts/${{ needs.detect.outputs.revision }}/
+          if-no-files-found: error
+          retention-days: 14
+  linux-arm-runtime:
+    needs: [detect, build]
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: v8-linux-arm64
+          path: artifacts/${{ needs.detect.outputs.revision }}
+      - name: Execute ARM64 native C ABI cases
+        run: python3 tool/smoke.py --library 'artifacts/${{ needs.detect.outputs.revision }}/linux-arm64/libsource_v8.so' --expected-version '${{ needs.detect.outputs.version }}' --output runtime-smoke.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-arm-runtime
+          path: runtime-smoke.json
+          if-no-files-found: error
+  publish:
+    needs: [detect, build, linux-arm-runtime]
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: v8-*
+          path: inputs
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: stable-pins
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-arm-runtime
+          path: arm-runtime
+      - name: Assemble complete deterministic release
+        run: |
+          cp arm-runtime/runtime-smoke.json inputs/v8-linux-arm64/linux-arm64/runtime-smoke.json
+          python3 -m unittest discover -s tool -p 'test_release.py'
+          python3 tool/release_package.py --inputs inputs --pins-file stable-pins.json --output dist --builder-revision "$GITHUB_SHA"
+      - name: Publish verified release without replacing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tool/release_publish.py --directory dist --repository "$GITHUB_REPOSITORY"
