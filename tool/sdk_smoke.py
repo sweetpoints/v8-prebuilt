@@ -95,11 +95,13 @@ def inputs(root):
     return contract, identity
 
 
-def compile_probe(root, contract, compiler, output, source):
+def compile_probe(root, contract, compiler, output, source, sysroot=None):
     style = contract.get('compilerStyle', 'clang-cl' if os.name == 'nt' else 'clang++')
     include = [sdk_path(root, item) for item in contract['includeDirs']]
     libraries = [sdk_path(root, item) for item in contract['libraries']]
     if style == 'clang-cl':
+        if sysroot is not None:
+            raise ValueError('clang-cl uses the Windows SDK environment rather than --sysroot')
         args = [str(compiler), '/nologo', '/std:c++20']
         args += ['/I' + str(path) for path in include]
         args += ['/D' + value for value in contract['defines']]
@@ -108,6 +110,10 @@ def compile_probe(root, contract, compiler, output, source):
         args += contract['linkOptions'] + contract['systemLibraries']
     elif style == 'clang++':
         args = [str(compiler), '-std=c++20']
+        if sysroot is not None:
+            if not sysroot.is_dir():
+                raise ValueError('consumer sysroot missing')
+            args.append('--sysroot=' + str(sysroot))
         args += ['-I' + str(path) for path in include]
         args += ['-D' + value for value in contract['defines']]
         args += contract['compileOptions'] + [str(source)]
@@ -119,8 +125,10 @@ def compile_probe(root, contract, compiler, output, source):
     subprocess.run(args, check=True, timeout=300)
     if not output.is_file():
         raise ValueError('consumer link did not produce an executable')
-    return subprocess.run([str(compiler), '--version'], check=True, capture_output=True,
-                          text=True, timeout=30).stdout.strip()
+    version = subprocess.run([str(compiler), '--version'], check=True, capture_output=True,
+                             text=True, timeout=30).stdout.strip()
+    return {'compiler': version, 'compileCommand': args,
+            'sysroot': str(sysroot) if sysroot is not None else None}
 
 
 def main():
@@ -129,6 +137,7 @@ def main():
     parser.add_argument('--expected-version', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--compiler', type=Path)
+    parser.add_argument('--sysroot', type=Path)
     parser.add_argument('--probe-output', type=Path)
     parser.add_argument('--probe-path', type=Path)
     parser.add_argument('--compile-report', type=Path)
@@ -151,10 +160,11 @@ def main():
         source.write_text(PROBE, encoding='utf-8')
         probe = (args.probe_path if args.execute_only else args.probe_output) or root / 'validation' / ('sdk-probe.exe' if os.name == 'nt' else 'sdk-probe')
         probe = probe.resolve()
-        compiler_version = None
+        compilation = None
         if not args.execute_only:
             probe.parent.mkdir(parents=True, exist_ok=True)
-            compiler_version = compile_probe(root, contract, args.compiler.resolve(), probe, source)
+            compilation = compile_probe(root, contract, args.compiler.resolve(), probe, source,
+                                        args.sysroot.resolve() if args.sysroot else None)
         evidence = {'schemaVersion': 1, 'scope': 'official V8 API SDK consumer',
                     'version': args.expected_version, **identity, 'probeSha256': sha(probe),
                     'probeSourceSha256': hashlib.sha256(PROBE.encode()).hexdigest(),
@@ -163,8 +173,8 @@ def main():
                     'cases': ['official_api_compile', 'official_api_link']}
         if probe.is_relative_to(root):
             evidence['probe'] = probe.relative_to(root).as_posix()
-        if compiler_version is not None:
-            evidence['compiler'] = compiler_version
+        if compilation is not None:
+            evidence.update(compilation)
         if args.execute_only:
             # The cross-built executable needs prior compile/link evidence.
             prior_path = args.compile_report or probe.with_name(probe.name + '.json')
@@ -175,6 +185,8 @@ def main():
             if prior.get('status') != 'compiled' or prior.get('cases') != ['official_api_compile', 'official_api_link']:
                 raise ValueError('missing cross-built compile/link proof')
             evidence['compiler'] = prior['compiler']
+            evidence['compileCommand'] = prior['compileCommand']
+            evidence['sysroot'] = prior.get('sysroot')
             evidence['compileHost'] = prior['host']
         if args.compile_only:
             evidence['status'] = 'compiled'
