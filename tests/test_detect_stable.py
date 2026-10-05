@@ -35,7 +35,8 @@ def release(draft=False):
 
 def manifest():
     return {'schemaVersion': 1, 'v8': {'version': VERSION, 'revision': REV,
-            'repository': d.V8_REPOSITORY}, 'targets': {target: {} for target in d.TARGETS}}
+            'repository': d.V8_REPOSITORY}, 'targets': {
+                target: {'artifactKind': 'v8-static-sdk'} for target in d.TARGETS}}
 
 
 class StableDetectorTest(unittest.TestCase):
@@ -103,6 +104,18 @@ class StableDetectorTest(unittest.TestCase):
         for draft in (False, True):
             with self.assertRaises(ValueError):
                 d.release_decision(release(draft), value, VERSION, REV)
+
+    def test_old_bridge_or_non_sdk_release_rejected_even_draft(self):
+        bridged = manifest()
+        bridged['bridge'] = {'abi': 1}
+        shared = manifest()
+        shared['targets']['macos-arm64']['artifactKind'] = 'shared-bridge'
+        absent_kind = manifest()
+        absent_kind['targets']['linux-x64'] = {}
+        for value in (bridged, shared, absent_kind):
+            for draft in (False, True):
+                with self.assertRaisesRegex(ValueError, 'pure V8 SDK'):
+                    d.release_decision(release(draft), value, VERSION, REV)
 
     def test_published_incomplete_manifest_or_assets_rejected(self):
         m = manifest()

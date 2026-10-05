@@ -110,6 +110,11 @@ def release_decision(release, manifest, version, revision):
         if (manifest.get('schemaVersion') != 1 or v8.get('version') != version
                 or v8.get('revision') != revision or v8.get('repository') != V8_REPOSITORY):
             raise ValueError('existing tag provenance conflicts with current stable revision')
+        targets = manifest.get('targets')
+        if ('bridge' in manifest or not isinstance(targets, dict)
+                or any(not isinstance(entry, dict) or entry.get('artifactKind') != 'v8-static-sdk'
+                       for entry in targets.values())):
+            raise ValueError('existing tag is not a pure V8 SDK release')
     if release.get('draft') is True:
         return True, 'draft'
     if manifest is None or set(manifest.get('targets', {})) != TARGETS:
