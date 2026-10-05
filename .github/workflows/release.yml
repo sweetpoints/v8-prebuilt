@@ -151,7 +151,7 @@ jobs:
               target = '${{ matrix.target }}'
               if target.startswith('linux-'):
                   arch = 'arm64' if target == 'linux-arm64' else 'amd64'
-                  sysroot = paths[0].parents[4] / ('third_party/debian_bullseye_' + arch + '-sysroot')
+                  sysroot = paths[0].parents[4] / ('build/linux/debian_bullseye_' + arch + '-sysroot')
                   if not sysroot.is_dir():
                       raise ValueError('Fixed official Chromium Linux sysroot missing')
                   stream.write('V8_SDK_SYSROOT=' + str(sysroot.resolve()) + '\n')
