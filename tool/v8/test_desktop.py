@@ -139,6 +139,10 @@ class DesktopTest(unittest.TestCase):
                 self.assertTrue(all(not Path(name).is_absolute() for name in result['linking']['libraries']))
                 self.assertEqual('clang-cl' if target.startswith('windows') else 'clang++', result['linking']['compilerStyle'])
                 self.assertEqual(['lib/' + path.name for path in paths.values()], result['linking']['libraries'])
+                flags = result['linking']['compileOptions']
+                self.assertIn('--target=' + ('x86_64-pc-windows-msvc' if target.startswith('windows') else 'aarch64-linux-gnu'), flags)
+                self.assertIn('/GR-' if target.startswith('windows') else '-fno-rtti', flags)
+                self.assertIn('/clang:-fno-exceptions' if target.startswith('windows') else '-fno-exceptions', flags)
 
 
 if __name__ == '__main__':
