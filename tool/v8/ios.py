@@ -263,8 +263,6 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
         (directory / 'args.gn').write_text(args)
         (directory / 'defines.json').write_text(json.dumps(defines, indent=2) + '\n')
         (directory / 'dependencies.txt').write_text(common.run([depot / 'gclient', 'revinfo', '--actual'], source.parent, env, capture=True))
-        (directory / 'build-inputs').mkdir()
-        (directory / 'build-inputs/ios.py').write_text(builder_source)
         clang = source / 'third_party/llvm-build/Release+Asserts/bin/clang++'
         toolchain = {
             'clang': common.run([clang, '--version'], source, env, capture=True).strip(),

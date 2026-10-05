@@ -152,6 +152,45 @@ class IOSContractTest(unittest.TestCase):
                 self.assertEqual(ios.output_for(source, out, source / 'depot', {}, '//:v8_monolith'), archive)
                 self.assertIn('--root-target=//:v8_monolith', run.call_args.args[0])
 
+    def test_sdk_publication_excludes_producer_source_and_keeps_input_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'v8'
+            source.mkdir()
+            (source / 'include').mkdir()
+            header = source / 'include/v8.h'
+            header.write_text('#pragma once')
+            (source / 'DEPS').write_text('fixed upstream dependencies')
+            out = ios.output_directory(source, 'ios-arm64')
+            out.mkdir(parents=True)
+            archive = out / 'libv8_monolith.a'
+            archive.write_bytes(archive_bytes(object_bytes()))
+            pins = copy.deepcopy(PINS)
+            pins['v8'] = {'version': '15.4.80.25'}
+            expected_args = ios.gn_arguments('ios-arm64', pins)
+            commands = []
+            def run(args, *unused, **kwargs):
+                commands.append([str(arg) for arg in args])
+                return 'fixed toolchain/dependency information'
+            def publish(src, target, actual_pins, files, entry, output_root):
+                self.assertEqual(target, 'ios-arm64')
+                self.assertEqual(set(files), {'include/v8.h', 'lib/libv8_monolith.a',
+                    'linking.json', 'args.gn', 'defines.json', 'dependencies.txt'})
+                self.assertEqual(files['args.gn'].read_text(), expected_args)
+                self.assertRegex(entry['platformBuildInputSha256'], r'^[0-9a-f]{64}$')
+                self.assertFalse(entry['validation']['runtimeTested'])
+                return Path(directory) / 'published'
+            with patch('ios.require_host'), patch('ios.common.source_version', return_value='15.4.80.25'), \
+                 patch('ios.common.run', side_effect=run), patch('ios.output_for', return_value=archive), \
+                 patch('ios.common.sdk_defines', return_value=['V8_TARGET_OS_IOS']) as defines, \
+                 patch('ios.common.gn_property', return_value=[]), \
+                 patch('ios.common.sdk_headers', return_value={'include/v8.h': header}), \
+                 patch('ios.link_smoke', return_value={'passed': True, 'runtimeExecuted': False}), \
+                 patch('ios.common.publish_sdk', side_effect=publish):
+                self.assertEqual(ios.build(source, source / 'depot', {}, 'ios-arm64', 2, pins), Path(directory) / 'published')
+                self.assertEqual(defines.call_args.kwargs['root_target'], '//:v8_monolith')
+            self.assertTrue(any(command[-1] == 'v8_monolith' for command in commands))
+            self.assertFalse(any('source_v8:source_v8' in arg for command in commands for arg in command))
+
     def test_inventory_indexes_every_file_by_content(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
