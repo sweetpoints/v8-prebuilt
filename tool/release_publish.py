@@ -33,7 +33,7 @@ class GitHub:
                    'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'v8-prebuilt-release', 'Content-Type': content_type}
         with urllib.request.build_opener(SafeRedirect()).open(urllib.request.Request(url, data=data, headers=headers, method=method), timeout=120) as r:
             result = r.read()
-            return json.loads(result) if r.headers.get('Content-Type', '').startswith('application/json') else result
+            return json.loads(result) if content_type != 'application/octet-stream' and r.headers.get('Content-Type', '').startswith('application/json') else result
 
     def by_tag(self, tag):
         try:

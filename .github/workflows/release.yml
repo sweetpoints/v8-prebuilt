@@ -140,7 +140,9 @@ jobs:
       - name: Assemble complete deterministic release
         run: |
           cp arm-runtime/runtime-smoke.json inputs/v8-linux-arm64/linux-arm64/runtime-smoke.json
-          python3 -m unittest discover -s tool -p 'test_release.py'
+          python3 -m unittest discover -s tests -p 'test_*.py'
+          python3 -m unittest discover -s tool -p 'test_*.py'
+          python3 -m unittest discover -s tool/v8 -p 'test_*.py'
           python3 tool/release_package.py --inputs inputs --pins-file stable-pins.json --output dist --builder-revision "$GITHUB_SHA"
       - name: Publish verified release without replacing assets
         env:
