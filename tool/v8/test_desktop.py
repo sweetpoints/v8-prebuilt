@@ -117,6 +117,32 @@ class DesktopTest(unittest.TestCase):
             self.assertNotIn('sources =', text)
             self.assertNotIn('source_v8', text)
 
+    def test_actual_link_dependencies_preserve_rust_system_libs_and_separate_archives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            out = source / 'out/sdk'
+            out.mkdir(parents=True)
+            archive = source / 'third_party/clang/runtime.a'
+            archive.parent.mkdir(parents=True)
+            archive.write_bytes(b'fixture-archive')
+            system, archives = desktop._link_dependencies(source, out, 'windows-arm64',
+                ['winmm', 'advapi32.lib', 'WINMM.lib', '//third_party/clang/runtime.a'],
+                ['legacy_stdio_definitions.lib', 'advapi32.lib', 'bcrypt.lib', 'kernel32.lib',
+                 'ntdll.lib', 'synchronization.lib', 'userenv.lib', 'ws2_32.lib', '/OPT:REF'])
+            self.assertEqual(['winmm.lib', 'advapi32.lib', 'legacy_stdio_definitions.lib',
+                'bcrypt.lib', 'kernel32.lib', 'ntdll.lib', 'synchronization.lib',
+                'userenv.lib', 'ws2_32.lib'], system)
+            self.assertEqual([archive.resolve()], archives)
+            system, archives = desktop._link_dependencies(source, out, 'linux-arm64',
+                ['dl', 'm', 'pthread', str(archive)], ['-Wl,--as-needed'])
+            self.assertEqual(['dl', 'm', 'pthread'], system)
+            self.assertEqual([archive.resolve()], archives)
+            with self.assertRaisesRegex(ValueError, 'missing or unsupported'):
+                desktop._link_dependencies(source, out, 'linux-x64', ['//missing.a'], [])
+            with self.assertRaisesRegex(ValueError, 'portable library name'):
+                desktop._link_dependencies(source, out, 'linux-x64', ['-Wl,something'], [])
+
+
     def test_sdk_profile_uses_actual_gn_outputs_and_matching_runtime_headers(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
@@ -146,9 +172,20 @@ class DesktopTest(unittest.TestCase):
                         if target.startswith('linux'):
                             flags.append('-fexperimental-relative-c++-abi-vtables')
                         return json.dumps({args[3]: {'cflags_cc': flags}})
+                    if args[3].startswith('//build/rust/std:'):
+                        values = ['legacy_stdio_definitions.lib', 'ws2_32.lib'] if args[4] == 'ldflags' else []
+                        return json.dumps({args[3]: {args[4]: values}})
+                    if args[4] in ('libs', 'ldflags'):
+                        values = (['winmm', 'advapi32.lib'] if target.startswith('windows') else ['dl', 'm', 'pthread']) if args[4] == 'libs' else ['bcrypt.lib', 'kernel32.lib', 'legacy_stdio_definitions.lib', '/OPT:REF']
+                        return json.dumps({args[3]: {args[4]: values}})
                     return json.dumps({args[3]: {'outputs': ['//' + paths[args[3]].relative_to(source).as_posix()]}})
                 result = desktop.sdk_profile(source, out, target, self.pins(), ['V8_COMPRESS_POINTERS'], run, 'gn', {})
                 self.assertEqual(2, len(result['libraries']))
+                if target.startswith('windows'):
+                    self.assertIn('ws2_32.lib', result['linking']['systemLibraries'])
+                    self.assertEqual(1, result['linking']['systemLibraries'].count('legacy_stdio_definitions.lib'))
+                else:
+                    self.assertEqual(['dl', 'm', 'pthread'], result['linking']['systemLibraries'])
                 self.assertEqual(config, result['runtimeHeaders']['include/c++/config/__config_site'])
                 self.assertEqual(vendor, result['runtimeHeaders']['include/c++/config/__assertion_handler'])
                 self.assertEqual(target.startswith('linux'), '-fexperimental-relative-c++-abi-vtables' in result['linking']['compileOptions'])

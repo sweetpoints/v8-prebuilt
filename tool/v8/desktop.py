@@ -171,13 +171,13 @@ def inspect_archive(path, target):
     return {'format': 'static-archive', 'objectMachine': MACHINES[target], 'objectCount': objects}
 
 
-def _gn_values(source, out, label, key, run, gn, env):
+def _gn_values(source, out, label, key, run, gn, env, config=False):
     values = json.loads(run([gn, 'desc', out, label, key, '--format=json', '--root-target=//sdk_runtime:sdk'],
                             source, env, capture=True))
     if isinstance(values, dict):
         if set(values) != {label} or not isinstance(values[label], dict):
             raise ValueError('GN output target differs from requested label')
-        values = values[label].get(key)
+        values = values[label].get(key, [] if config else None)
     if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
         raise ValueError('GN ' + key + ' must contain a string array')
     return values
@@ -213,6 +213,38 @@ def _gn_archive(source, out, label, run, gn, env, target):
     if len(archives) != 1:
         raise ValueError('Expected exactly one static archive for ' + label)
     return archives[0]
+
+
+def _link_dependencies(source, out, target, libs, ldflags):
+    """Separate actual GN system libraries from source-local static inputs."""
+    windows = target.startswith('windows-')
+    system, archives = [], []
+    values = list(libs)
+    if windows:
+        # Rust's official std configs deliberately express these as ldflags.
+        values += [flag for flag in ldflags if flag.lower().endswith('.lib') and
+                   not flag.startswith(('-', '/DEFAULTLIB:', '/defaultlib:'))]
+    for value in values:
+        value = value.replace('\\', '/')
+        if value.startswith('//'):
+            path = Path(source) / value[2:]
+        elif Path(value).is_absolute() or re.match(r'^[A-Za-z]:/', value):
+            path = Path(value)
+        elif '/' in value:
+            path = Path(out) / value
+        else:
+            if not re.fullmatch(r'[A-Za-z0-9_+.-]+', value):
+                raise ValueError('GN system library is not a portable library name')
+            name = value if not windows or value.lower().endswith('.lib') else value + '.lib'
+            if name.lower() not in {item.lower() for item in system}:
+                system.append(name)
+            continue
+        if path.suffix.lower() not in ('.a', '.lib') or not path.is_file():
+            raise ValueError('GN archive dependency missing or unsupported: ' + value)
+        path = path.resolve()
+        if path not in archives:
+            archives.append(path)
+    return system, archives
 
 
 def sdk_profile(source, out, target, pins, defines, run, gn, env):
@@ -253,6 +285,17 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
         headers['include/c++/config/' + name] = path
     abi_options = _consumer_abi_options(
         _gn_values(source, out, '//:v8_monolith', 'cflags_cc', run, gn, env))
+    official_libs = _gn_values(source, out, '//:v8_monolith', 'libs', run, gn, env)
+    official_ldflags = _gn_values(source, out, '//:v8_monolith', 'ldflags', run, gn, env)
+    # Static libraries do not necessarily inherit Rust's final-executable
+    # configs. Read their resolved official values rather than copying names.
+    for label in ('//build/rust/std:stdlib_dependent_libs',
+                  '//build/rust/std:stdlib_public_dependent_libs'):
+        official_libs += _gn_values(source, out, label, 'libs', run, gn, env, config=True)
+        if os_name == 'windows':
+            official_ldflags += _gn_values(source, out, label, 'ldflags', run, gn, env, config=True)
+    system_libraries, archive_dependencies = _link_dependencies(
+        source, out, target, official_libs, official_ldflags)
     triple = ({'x64': 'x86_64', 'arm64': 'aarch64'}[cpu] +
               ('-pc-windows-msvc' if os_name == 'windows' else '-linux-gnu'))
     linking = {
@@ -264,8 +307,7 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
                            ['-std=c++20', '-nostdinc++', '-fPIC', '-fno-rtti', '-fno-exceptions', '--target=' + triple]),
         'libraries': list(libraries),
         'linkOptions': ['/machine:' + cpu] if os_name == 'windows' else ['-nostdlib++', '--target=' + triple],
-        'systemLibraries': (['winmm.lib', 'dbghelp.lib', 'advapi32.lib'] if os_name == 'windows' else
-                            ['dl', 'm', 'pthread', 'rt']),
+        'systemLibraries': system_libraries,
         'cxxRuntime': 'pinned Chromium libc++ (__Cr ABI)',
         'featureProfile': {
             'internationalization': True, 'temporal': True, 'icuData': 'embedded',
@@ -282,4 +324,5 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
             'distribution': 'debian-bullseye',
             'sourceRevision': pins['v8']['revision'],
         }
-    return {'libraries': libraries, 'runtimeHeaders': headers, 'linking': linking}
+    return {'libraries': libraries, 'runtimeHeaders': headers, 'linking': linking,
+            'archiveDependencies': archive_dependencies}
