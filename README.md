@@ -147,6 +147,33 @@ source revision. The updater does not automatically commit a changed pins.json.
 All required matrix targets and release verification must pass before a release
 is published; a partial matrix is not a complete release.
 
+## Assemble and publish a complete release
+
+After collecting the ten successful target outputs under `artifacts/inputs`,
+package them using the exact resolved pin file and builder commit:
+
+```sh
+python3 tool/release_package.py --inputs artifacts/inputs \
+  --pins-file artifacts/resolved-pins.json --output dist \
+  --builder-revision "$(git rev-parse HEAD)"
+```
+
+The packager rejects a missing, duplicate or unknown target, provenance conflicts
+and mismatched binary/header/license hashes. It generates deterministic tar.gz
+archives, the release manifest, resolved pins and checksum list. Publish with
+`GH_TOKEN` set in the environment:
+
+```sh
+python3 tool/release_publish.py --directory dist \
+  --repository sweetpoints/v8-prebuilt
+```
+
+The publisher uploads through a draft, reads uploaded assets back and checks them
+before making the release public. Existing differing assets are not overwritten;
+a matching draft can resume. Publication is an external action, not a side
+effect of local compilation. A public release still does not establish every
+consumer application's signing, packaging, runtime or source compatibility.
+
 ## Licensing
 
 The bridge and repository code are covered by the [GPL-3.0 license](LICENSE).
