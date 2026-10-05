@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
   }
   isolate->Dispose();
   v8::V8::Dispose();
-  v8::V8::ShutdownPlatform();
+  v8::V8::DisposePlatform();
   if (!passed) return 4;
   std::puts("official-v8-api-sdk-consumer-passed");
   return 0;
