@@ -1,9 +1,10 @@
 # v8-prebuilt
 
-Build the official V8 stable source with the `source_v8` C ABI bridge and publish
-checksummed artifacts for Android, iOS, macOS, Linux and Windows. This repository
-produces the bridge library and its provenance together. It does not download a
-third party V8 binary and wrap it afterwards.
+Build the official V8 stable source and publish checksummed **pure V8 SDKs** for
+Android, iOS, macOS, Linux and Windows. Each target SDK supplies the official V8
+monolithic static library, public C++ headers and recorded compiler/linking inputs.
+Application bridges, Dart FFI wrappers and book-source APIs belong in their
+consumer repositories, including Legado; they are not SDK binaries here.
 
 The initial source pin is V8 **15.4.80.24**, revision
 `e422f6ef0c7b877b04e4872fd0bd3a1cc2ec2eee`. V8 and depot_tools come from their
@@ -61,8 +62,8 @@ gh workflow run release.yml --repo sweetpoints/v8-prebuilt
 ```
 
 All ten builds use the same uploaded `stable-pins.json`. The publication job
-depends on the complete build matrix and Linux ARM64 native smoke job. Desktop
-smoke checks run on the matching supported host; Android and iOS build outputs
+depends on the complete build matrix and required native probe jobs. Desktop
+probes compile and run a V8 C++ embedder on the matching supported host; Android and iOS build outputs
 do not by themselves claim device execution. The workflow is implemented, but
 its implementation is not evidence that a remote run has already succeeded.
 
@@ -108,13 +109,13 @@ success is separate from native ARM64 execution. Windows uses an installed Visua
 Studio toolchain with `DEPOT_TOOLS_WIN_TOOLCHAIN=0`, official clang and a static
 CRT; the CI runner version is not a promise of a minimum Windows version.
 iOS requires a full Xcode installation on Darwin ARM64, produces static SDK
-archives, and disables JIT and WebAssembly. Desktop and Android outputs are
-`libsource_v8.so`, `libsource_v8.dylib` or `source_v8.dll` as appropriate.
+archives, and disables JIT and WebAssembly. All targets produce static V8 SDKs. Use their recorded libraries, feature
+definitions, C++ runtime dependencies and linker flags when compiling an embedder.
 
 ## Download a released target
 
 Release archives use `v8-<version>-<target>.tar.gz`. Each archive contains its
-single-target manifest, resolved `pins.json`, the binary, SDK header and collected
+single-target manifest, resolved `pins.json`, static libraries, public V8 headers, link metadata and collected
 license files. A complete release also includes `release-manifest.json`,
 `pins.json` and `SHA256SUMS`. Until a release is published, these filenames are
 the packaging contract rather than available downloads.
@@ -140,30 +141,33 @@ PYVERIFY
 tar -xzf "v8-$version-$target.tar.gz"
 ```
 
-Also verify the extracted manifest's full source and bridge identity, selected
-target and individual binary hash before loading or linking it. SHA256SUMS
+Also verify the extracted manifest's full upstream source and SDK producer identity, selected
+target and individual library hashes before linking it. SHA256SUMS
 checks integrity against the release metadata; it is not an independent digital
 signature. Consumers should pin an exact release and approved artifact digest.
-iOS provides static archives and SDK headers rather than a normal dynamic
-library; follow the iOS target's linking metadata.
+Follow the target's linking metadata rather than copying compiler flags from
+another architecture or V8 build.
 
 ## Source and artifact identity
 
 The build pin fixes official V8 and depot_tools revisions. Dependency sources
 and compiler inputs follow that V8 revision's DEPS; each target records the
 actual host/toolchain identity and hashes of GN arguments, DEPS, dependency
-inventory and build definitions. The bridge source hash and C ABI version are
-part of the artifact manifest. A consumer must validate both upstream and bridge
-identity, target, minimum OS/API, binary size and SHA-256.
+inventory and build definitions. Producer inputs and SDK file inventories are
+part of the artifact manifest. A consumer must validate source and producer
+identity, target, minimum OS/API, library sizes and SHA-256.
 
 Current build definitions disable Intl and Temporal and embed startup data in the
 library. These SDKs are not a promise of every V8 optional feature.
 
-The builder compiles the C ABI bridge within the V8 GN graph. Consumers call the
-C interface in `src/source_v8.h`; they do not link an independently compiled C++
-wrapper against an arbitrary V8 C++ ABI. Build validation and runtime/source
-compatibility validation are separate manifest fields. A successful link is
-not a successful device test or evidence that all historical book sources work.
+Consumers compile against the SDK's matching official V8 C++ headers and feature
+definitions, and link the provided monolith with its recorded standard-library
+and system dependencies. These inputs are part of the SDK contract; an arbitrary
+V8 header/library pair or unrelated libc++ build is not interchangeable.
+Build and link probes are distinct from runtime execution. A successful compile
+or link is not a successful device test or evidence that all historical book
+sources work. Probe source templates may be used for validation; they do not
+turn the SDK into an application bridge distribution.
 
 A release tag has the form `v8-<version>` and identifies the **builder repository
 commit**. The release also carries the resolved pin file and full upstream
@@ -200,13 +204,15 @@ consumer application's signing, packaging, runtime or source compatibility.
 
 ## Licensing
 
-The bridge and repository code are covered by the [GPL-3.0 license](LICENSE).
-V8 and its third party dependencies retain their own upstream licenses; the
-bridge's GPL license does not replace those notices. Build artifacts include
-collected upstream license/notice files and their hashes. Notice collection is
-not a claim that every redistribution obligation has been independently audited.
+Repository build and release scripts derived from Legado are covered by the
+[GPL-3.0 license](LICENSE). The V8 SDK binaries contain upstream V8 and its
+recorded dependencies, not Legado's GPL application bridge. V8 and dependency
+licenses retain their upstream scope; the repository script license does not
+relabel those upstream sources or SDK components.
 
-Because the packaged library combines the bridge and V8, consumers must account
-for the bridge's license as well as V8 and dependency licenses when distributing
-it. These artifacts are not offered as a BSD-only V8 distribution. Corresponding
-source must be recoverable from the builder tag, source pins and recorded inputs.
+SDK archives include collected upstream license/notice files and their hashes.
+Source provenance is recoverable from the full official revision, DEPS and
+recorded toolchain inputs. Consumers distributing an application bridge must
+handle that bridge's license in its own repository; this SDK supplies no
+`source_v8` or `sv8_*` bridge. Notice collection is not a claim that all
+redistribution obligations have been independently audited.
