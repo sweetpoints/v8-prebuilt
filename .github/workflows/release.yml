@@ -82,6 +82,51 @@ jobs:
       - name: Select source cache path
         if: runner.os != 'Windows'
         run: echo "V8_CACHE_ROOT=$GITHUB_WORKSPACE/.cache/v8-source" >> "$GITHUB_ENV"
+      - name: Install the official Windows SDK required by the pinned toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdkVersion = '10.0.28000.0'
+          $sdkArch = if ('${{ matrix.target }}' -eq 'windows-arm64') { 'arm64' } else { 'x64' }
+          function Get-RequiredWindowsSdk {
+            $roots = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -ErrorAction SilentlyContinue
+            if ($null -eq $roots -or [string]::IsNullOrWhiteSpace($roots.KitsRoot10)) { return $null }
+            $kits = $roots.KitsRoot10
+            $required = @(
+              "Include\$sdkVersion\um\Windows.h",
+              "Include\$sdkVersion\shared\sdkddkver.h",
+              "Include\$sdkVersion\ucrt\stdlib.h",
+              "Lib\$sdkVersion\um\$sdkArch\kernel32.lib",
+              "Lib\$sdkVersion\ucrt\$sdkArch\libucrt.lib"
+            )
+            foreach ($relative in $required) {
+              if (-not (Test-Path (Join-Path $kits $relative) -PathType Leaf)) { return $null }
+            }
+            return $kits
+          }
+          $kits = Get-RequiredWindowsSdk
+          if ($null -eq $kits) {
+            # Microsoft's September 2026 servicing installer for SDK 28000.
+            # https://learn.microsoft.com/windows/apps/windows-sdk/downloads
+            $url = 'https://download.microsoft.com/download/e6cfffdc-0d3e-4c6c-96d7-d491da459a07/KIT_BUNDLE_WINDOWSSDK_MEDIACREATION/winsdksetup.exe'
+            $installer = Join-Path $env:RUNNER_TEMP 'winsdksetup-10.0.28000.2957.exe'
+            Invoke-WebRequest -Uri $url -OutFile $installer
+            $expected = 'E8E264ACA8BC34ABDF592352BF09F986A85CDB96DB0EFBA405CA9E149181FE61'
+            if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne $expected) { throw 'Official Windows SDK installer hash differs' }
+            $signature = Get-AuthenticodeSignature $installer
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+              throw 'Official Windows SDK installer signature is not valid Microsoft code signing'
+            }
+            # /q is the silent switch recorded by Microsoft's WinGet SDK manifests.
+            # Install the vendor defaults, then require the exact target headers/libs.
+            $process = Start-Process -FilePath $installer -ArgumentList @('/q', '/norestart') -Wait -PassThru
+            if ($process.ExitCode -notin @(0, 3010)) { throw "Windows SDK install failed: $($process.ExitCode)" }
+            $kits = Get-RequiredWindowsSdk
+          }
+          if ($null -eq $kits) { throw "Required Windows SDK $sdkVersion headers and $sdkArch libraries are missing after installation" }
+          "WINDOWSSDKDIR=$kits" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Verified Windows SDK $sdkVersion headers and $sdkArch libraries"
       - name: Fetch fixed official source and DEPS
         run: python tool/v8/build.py bootstrap --target '${{ matrix.target }}' --pins-file stable-pins.json --cache-root "$V8_CACHE_ROOT"
       - name: Install official Linux build dependencies
