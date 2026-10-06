@@ -58,7 +58,7 @@ def check_metadata(item,name):
     return {'id':identifier,'name':name,'sha256':checksum,'size':size}
 
 def archive_bytes(gh,item):
-    data=gh.request(gh.base+f"/actions/artifacts/{item['id']}/zip",content_type='application/octet-stream')
+    data=gh.request(gh.base+f"/actions/artifacts/{item['id']}/zip",content_type='application/octet-stream',accept='application/vnd.github+json')
     if len(data)!=item['size'] or sha(data)!=item['sha256']:raise ValueError('Reused ZIP digest/size differs')
     return data
 

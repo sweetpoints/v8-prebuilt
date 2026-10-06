@@ -12,6 +12,7 @@ import textwrap
 import warnings
 import release_resume as resume
 from release_pins import make_pins
+from release_publish import GitHub
 
 class ResumeTests(unittest.TestCase):
     def setUp(self):
@@ -31,7 +32,7 @@ class ResumeTests(unittest.TestCase):
             self.items[identifier]={'id':identifier,'name':name,'digest':'sha256:'+sha,'size_in_bytes':size,'expired':False,'workflow_run':{'id':resume.RUN_ID,'head_sha':resume.PRODUCER}}
         class API:
             base='https://api.github.com/repos/example/sdk'
-            def request(inner,url,content_type=None):
+            def request(inner,url,content_type=None,accept=None):
                 if url.endswith('/zip'):return self.zip
                 if '/jobs?' in url:return {'jobs':self.jobs}
                 if '/actions/runs/' in url:return self.run
@@ -59,6 +60,17 @@ class ResumeTests(unittest.TestCase):
     def test_zip_actual_digest_not_only_api_metadata(self):
         self.zip+=b'corrupt'
         with self.assertRaisesRegex(ValueError,'ZIP digest/size'):self.plan()
+    def test_actions_zip_requests_json_accept_but_preserves_binary_response(self):
+        response=Mock();response.read.return_value=self.zip;response.headers={'Content-Type':'application/zip'}
+        response.__enter__=Mock(return_value=response);response.__exit__=Mock(return_value=False)
+        opener=Mock();opener.open.return_value=response
+        item={'id':1,'size':len(self.zip),'sha256':hashlib.sha256(self.zip).hexdigest()}
+        with patch('urllib.request.build_opener',return_value=opener):
+            actual=resume.archive_bytes(GitHub('example/sdk','fixture-token'),item)
+        self.assertEqual(self.zip,actual)
+        request=opener.open.call_args.args[0]
+        self.assertEqual('application/vnd.github+json',request.get_header('Accept'))
+        self.assertEqual('application/octet-stream',request.get_header('Content-type'))
     def test_target_config_changed_rejected(self):
         path=self.root/'tool/v8/pins.json';base=json.loads(path.read_text());base['targets']['android-arm64']['minApi']=27;path.write_text(json.dumps(base))
         with self.assertRaisesRegex(ValueError,'target configurations'):self.plan()

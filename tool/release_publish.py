@@ -27,9 +27,9 @@ class GitHub:
         self.base = 'https://api.github.com/repos/' + repository
         self.token = token
 
-    def request(self, url, method='GET', body=None, content_type='application/json'):
+    def request(self, url, method='GET', body=None, content_type='application/json', accept=None):
         data = json.dumps(body).encode() if isinstance(body, dict) else body
-        headers = {'Authorization': 'Bearer ' + self.token, 'Accept': ('application/octet-stream' if method == 'GET' and content_type == 'application/octet-stream' else 'application/vnd.github+json'),
+        headers = {'Authorization': 'Bearer ' + self.token, 'Accept': accept or ('application/octet-stream' if method == 'GET' and content_type == 'application/octet-stream' else 'application/vnd.github+json'),
                    'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'v8-prebuilt-release', 'Content-Type': content_type}
         with urllib.request.build_opener(SafeRedirect()).open(urllib.request.Request(url, data=data, headers=headers, method=method), timeout=120) as r:
             result = r.read()
