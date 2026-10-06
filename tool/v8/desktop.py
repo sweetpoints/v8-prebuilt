@@ -323,6 +323,13 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
     linking['abiCompileOptions'] = abi_options
     linking['compileOptions'] = list(dict.fromkeys(linking['compileOptions'] + abi_options))
     if os_name == 'linux':
+        # The SDK is built with the pinned LLD toolchain. Clang's Linux
+        # default selects host GNU ld, bypassing that tested toolchain.
+        linker_flags = _gn_values(source, out, '//build/config/compiler:linker',
+                                  'ldflags', run, gn, env, config=True)
+        if '-fuse-ld=lld' not in linker_flags:
+            raise ValueError('Pinned Linux SDK requires the official LLD linker config')
+        linking['linkOptions'].append('-fuse-ld=lld')
         actual_cflags = _gn_values(source, out, '//:v8_monolith', 'cflags', run, gn, env)
         if '-pthread' in actual_cflags:
             linking['compileOptions'].append('-pthread')

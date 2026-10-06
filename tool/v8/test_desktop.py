@@ -172,6 +172,8 @@ class DesktopTest(unittest.TestCase):
                         if target.startswith('linux'):
                             flags.append('-fexperimental-relative-c++-abi-vtables')
                         return json.dumps({args[3]: {'cflags_cc': flags}})
+                    if args[3] == '//build/config/compiler:linker':
+                        return json.dumps({args[3]: {'ldflags': ['-fuse-ld=lld', '-Werror', '-B/private/compiler']}})
                     if args[3] == '//build/config:default_libs':
                         values = ['kernel32.lib'] if target.startswith('windows') else ['dl', 'pthread', 'rt']
                         return json.dumps({args[3]: {'libs': values}})
@@ -192,6 +194,8 @@ class DesktopTest(unittest.TestCase):
                 else:
                     self.assertEqual(['m', 'dl', 'pthread', 'rt'], result['linking']['systemLibraries'])
                     self.assertIn('-pthread', result['linking']['compileOptions'])
+                    self.assertIn('-fuse-ld=lld', result['linking']['linkOptions'])
+                    self.assertFalse(any('/private/' in option for option in result['linking']['linkOptions']))
                 self.assertEqual(config, result['runtimeHeaders']['include/c++/config/__config_site'])
                 self.assertEqual(vendor, result['runtimeHeaders']['include/c++/config/__assertion_handler'])
                 self.assertEqual(target.startswith('linux'), '-fexperimental-relative-c++-abi-vtables' in result['linking']['compileOptions'])
@@ -208,6 +212,13 @@ class DesktopTest(unittest.TestCase):
                 self.assertIn('--target=' + ('x86_64-pc-windows-msvc' if target.startswith('windows') else 'aarch64-linux-gnu'), flags)
                 self.assertIn('/GR-' if target.startswith('windows') else '-fno-rtti', flags)
                 self.assertIn('/clang:-fno-exceptions' if target.startswith('windows') else '-fno-exceptions', flags)
+                if target.startswith('linux'):
+                    def without_lld(args, *a, **kw):
+                        if args[3] == '//build/config/compiler:linker':
+                            return json.dumps({args[3]: {}})
+                        return run(args, *a, **kw)
+                    with self.assertRaisesRegex(ValueError, 'official LLD'):
+                        desktop.sdk_profile(source, out, target, self.pins(), [], without_lld, 'gn', {})
                 vendor.unlink()
                 with self.assertRaisesRegex(ValueError, 'vendor headers missing'):
                     desktop.sdk_profile(source, out, target, self.pins(), [], run, 'gn', {})
