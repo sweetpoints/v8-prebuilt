@@ -205,7 +205,8 @@ class IOSContractTest(unittest.TestCase):
                 self.assertEqual(target, 'ios-arm64')
                 self.assertEqual(set(files), {'include/v8.h', 'lib/libv8_monolith.a',
                     'linking.json', 'args.gn', 'defines.json', 'dependencies.txt', 'lib/libclang_rt.ios.a',
-                    'lib/libv8_rust_runtime.a', 'validation/rust-runtime.json'})
+                    'lib/libv8_rust_runtime.a', 'validation/rust-runtime.json',
+                    'validation/browser-engine-kit-policy.json'})
                 self.assertEqual(files['lib/libclang_rt.ios.a'].read_bytes(), runtime.read_bytes())
                 linking = json.loads(files['linking.json'].read_text())
                 self.assertEqual(linking['libraries'], ['lib/libv8_monolith.a',
@@ -213,6 +214,8 @@ class IOSContractTest(unittest.TestCase):
                 self.assertEqual(files['lib/libv8_rust_runtime.a'].read_bytes(), rust.read_bytes())
                 self.assertEqual(files['validation/rust-runtime.json'].read_text(), rust_evidence.read_text())
                 self.assertNotIn('//third_party/llvm/libclang_rt.ios.a', linking['systemLibraries'])
+                self.assertEqual(linking['linkOptions'], ['-weak_framework', 'BrowserEngineKit'])
+                self.assertEqual(len(linking['browserEngineKitPolicy']['checkedArchives']), 3)
                 self.assertEqual(files['args.gn'].read_text(), expected_args)
                 self.assertRegex(entry['platformBuildInputSha256'], r'^[0-9a-f]{64}$')
                 self.assertFalse(entry['validation']['runtimeTested'])
@@ -221,7 +224,7 @@ class IOSContractTest(unittest.TestCase):
             with patch('ios.require_host'), patch('ios.common.source_version', return_value='15.4.80.25'), \
                  patch('ios.common.run', side_effect=run), patch('ios.output_for', return_value=archive), \
                  patch('ios.common.sdk_defines', return_value=['V8_TARGET_OS_IOS']) as defines, \
-                 patch('ios.common.gn_property', side_effect=[[], ['//third_party/llvm/libclang_rt.ios.a']]), \
+                 patch('ios.common.gn_property', side_effect=[['BrowserEngineKit.framework'], ['//third_party/llvm/libclang_rt.ios.a']]), \
                  patch('ios.common.sdk_headers', return_value={'include/v8.h': header}), \
                  patch('ios.common.sdk_rust_runtime', return_value=(rust, rust_evidence)) as rust_helper, \
                  patch('ios.common.sdk_archive_dependency', return_value=runtime) as dependency, \
@@ -248,6 +251,41 @@ class IOSContractTest(unittest.TestCase):
             self.assertFalse(any(value.startswith('//') for value in contract['systemLibraries']))
             for bad in ['//missing.a', '//../outside.a', '/usr/lib/untracked.a', '-lobjc', 'libthing.a']:
                 with self.assertRaises(ValueError): ios.collect_link_libraries(source, [bad])
+
+    def test_bek_policy_checks_every_archive_and_rejects_required_symbols(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'lib').mkdir()
+            for name in ['libv8_monolith.a', 'libv8_rust_runtime.a', 'compiler.a']:
+                (root / 'lib' / name).write_bytes(name.encode())
+            with patch('ios.common.run', return_value=' U _malloc\n') as nm:
+                policy = ios.browser_engine_kit_policy(root, root, ['BrowserEngineKit.framework'], {})
+                self.assertEqual(len(policy['checkedArchives']), 3)
+                self.assertEqual(nm.call_count, 3)
+                self.assertTrue(all(call.args[0][1] == '-u' for call in nm.call_args_list))
+                contract = ios.link_contract('ios-arm64', PINS, [], ['BrowserEngineKit.framework'], bek_policy=policy)
+                self.assertEqual(contract['linkOptions'], ['-weak_framework', 'BrowserEngineKit'])
+            for output in [' U _be_memory_inline_jit_restrict_rwx_to_rw\n',
+                           ' U _OBJC_CLASS_$_BEWebApp\n', ' U _BrowserEngineRuntime\n']:
+                with patch('ios.common.run', side_effect=[' U _malloc\n', output]):
+                    with self.assertRaisesRegex(ValueError, 'requires BrowserEngineKit'):
+                        ios.browser_engine_kit_policy(root, root, ['BrowserEngineKit.framework'], {})
+            with self.assertRaises(ValueError):
+                ios.link_contract('ios-arm64', PINS, [], ['BrowserEngineKit.framework'])
+
+    def test_bek_final_load_command_must_be_weak(self):
+        name = b'/System/Library/Frameworks/BrowserEngineKit.framework/BrowserEngineKit\0'
+        size = (24 + len(name) + 7) & ~7
+        command = struct.pack('<6I', 0x80000018, size, 24, 0, 0, 0) + name
+        command += b'\0' * (size - len(command))
+        header = struct.pack('<8I', 0xfeedfacf, 0x0100000c, 0, 2, 1, size, 0, 0)
+        self.assertEqual(ios.inspect_browser_engine_kit_dependency(header + command)['loadCommand'], 'LC_LOAD_WEAK_DYLIB')
+        strong = bytearray(header + command)
+        struct.pack_into('<I', strong, 32, 0xc)
+        with self.assertRaisesRegex(ValueError, 'must be LC_LOAD_WEAK_DYLIB'):
+            ios.inspect_browser_engine_kit_dependency(strong)
+        with self.assertRaises(ValueError):
+            ios.inspect_browser_engine_kit_dependency(object_bytes(filetype=2))
 
     def test_inventory_indexes_every_file_by_content(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -315,7 +353,12 @@ class AppleSDKObjectTest(unittest.TestCase):
                     subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), str(obj)], check=True)
                 archives, system = ios.collect_link_libraries(source, ['//third_party/llvm/libclang_rt.test.a'])
                 for relative, archive in archives.items(): shutil.copyfile(archive, sdk_dir / relative)
-                contract = ios.link_contract(target, PINS, [], system_libraries=system, archives=archives)
+                tool = source / 'third_party/llvm-build/Release+Asserts/bin/llvm-nm'
+                tool.parent.mkdir(parents=True, exist_ok=True)
+                tool.symlink_to('/usr/bin/nm')
+                policy = ios.browser_engine_kit_policy(sdk_dir, source, ['BrowserEngineKit.framework'], dict(os.environ))
+                contract = ios.link_contract(target, PINS, [], ['BrowserEngineKit.framework'],
+                    system_libraries=system, archives=archives, bek_policy=policy)
                 (sdk_dir / 'linking.json').write_text(json.dumps(contract))
                 with patch('ios.LINK_SMOKE', 'int monolith(); int main(){return monolith()==42?0:1;}'):
                     proof = ios.link_smoke(sdk_dir, source, target, PINS, dict(os.environ))
@@ -323,6 +366,7 @@ class AppleSDKObjectTest(unittest.TestCase):
                 self.assertFalse(proof['runtimeExecuted'])
                 self.assertEqual(proof['executableInspection']['platform'], ios.PLATFORMS[target])
                 self.assertIn(str(sdk_dir / 'lib/libclang_rt.test.a'), proof['command'])
+                self.assertEqual(proof['browserEngineKitDependency']['loadCommand'], 'LC_LOAD_WEAK_DYLIB')
                 self.assertFalse(any(arg.startswith('-l//') for arg in proof['command']))
 
 

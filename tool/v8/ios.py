@@ -214,16 +214,63 @@ def collect_link_libraries(source, libraries):
     return archives, list(dict.fromkeys(system))
 
 
-def link_contract(target, pins, defines, frameworks=(), system_libraries=(), archives=()):
+def browser_engine_kit_policy(directory, source, frameworks, env):
+    if 'BrowserEngineKit.framework' not in frameworks:
+        return None
+    tool = source / 'third_party/llvm-build/Release+Asserts/bin/llvm-nm'
+    archives = sorted((directory / 'lib').glob('*.a'))
+    if not archives:
+        raise ValueError('BrowserEngineKit policy requires the full SDK archive inventory')
+    checked = []
+    for archive in archives:
+        output = common.run([tool, '-u', archive], source, env, capture=True)
+        if re.search(r'(?:^|\s)_*be_[A-Za-z0-9_$]+(?:\s|$)|BrowserEngine|OBJC_(?:CLASS|METACLASS)_\$_BE', output):
+            raise ValueError('SDK archive requires BrowserEngineKit symbols: ' + archive.name)
+        checked.append({'path': archive.relative_to(directory).as_posix(), 'sha256': common.sha(archive),
+                        'undefinedSymbolsSha256': hashlib.sha256(output.encode()).hexdigest()})
+    return {'schemaVersion': 1, 'framework': 'BrowserEngineKit', 'linkage': 'weak',
+            'reason': 'Preserve iOS 15 without requiring the iOS 17.4 framework',
+            'frameworkAvailableFromIOS': '17.4', 'requiredUndefinedSymbols': False,
+            'nmTool': 'third_party/llvm-build/Release+Asserts/bin/llvm-nm',
+            'checkedArchives': checked}
+
+
+def inspect_browser_engine_kit_dependency(data):
+    commands, size = struct.unpack_from('<II', data, 16)
+    offset, found = 32, []
+    for _ in range(commands):
+        command, length = struct.unpack_from('<II', data, offset)
+        if length < 8 or offset + length > 32 + size:
+            raise ValueError('Invalid Mach-O dylib load command')
+        if command in (0xc, 0x80000018, 0x8000001f, 0x20, 0x80000023):
+            if length < 24:
+                raise ValueError('Truncated Mach-O dylib command')
+            name_offset = struct.unpack_from('<I', data, offset + 8)[0]
+            if not 24 <= name_offset < length:
+                raise ValueError('Invalid Mach-O dylib name offset')
+            name = data[offset + name_offset:offset + length].split(b'\0', 1)[0].decode('utf-8')
+            if Path(name).name == 'BrowserEngineKit':
+                if command != 0x80000018:
+                    raise ValueError('BrowserEngineKit must be LC_LOAD_WEAK_DYLIB for the iOS 15 SDK')
+                found.append(name)
+        offset += length
+    if len(found) != 1:
+        raise ValueError('Expected exactly one weak BrowserEngineKit dependency')
+    return {'framework': 'BrowserEngineKit', 'loadCommand': 'LC_LOAD_WEAK_DYLIB', 'path': found[0]}
+
+
+def link_contract(target, pins, defines, frameworks=(), system_libraries=(), archives=(), bek_policy=None):
     config = configuration(target, pins)
-    return {
+    if 'BrowserEngineKit.framework' in frameworks and not bek_policy:
+        raise ValueError('BrowserEngineKit requires verified SDK undefined-symbol policy')
+    contract = {
         'schemaVersion': 1, 'kind': 'ios-static-sdk', 'target': target, 'architecture': 'arm64',
         'environment': config['environment'], 'sdk': SDKS[target], 'minIOS': config['minIOS'],
         'clangTarget': 'arm64-apple-ios' + config['minIOS'] + ('-simulator' if target.endswith('simulator-arm64') else ''),
         'nativeV8Archive': 'lib/libv8_monolith.a',
         'includeDirs': ['include'], 'defines': defines, 'compileOptions': ['-std=c++20'],
         'libraries': ['lib/libv8_monolith.a', *archives],
-        'linkOptions': [arg for name in frameworks for arg in ('-framework', name.removesuffix('.framework'))],
+        'linkOptions': [arg for name in frameworks for arg in ('-weak_framework' if name == 'BrowserEngineKit.framework' else '-framework', name.removesuffix('.framework'))],
         'systemLibraries': list(dict.fromkeys(['c++', *system_libraries])),
         'cxxStandard': 'c++20', 'stdlib': 'Xcode SDK libc++ (system; not bundled)',
         'runtimeFlags': ['--jitless'], 'compileTimeJitless': True, 'webAssembly': False,
@@ -232,6 +279,9 @@ def link_contract(target, pins, defines, frameworks=(), system_libraries=(), arc
                            'icuData': 'embedded', 'jit': False, 'webAssembly': False,
                            'experimentalRuntimeFlags': []},
     }
+    if bek_policy:
+        contract['browserEngineKitPolicy'] = bek_policy
+    return contract
 
 
 def link_smoke(directory, source, target, pins, env):
@@ -251,11 +301,14 @@ def link_smoke(directory, source, target, pins, env):
     command += ['-Wl,-dead_strip', '-o', output]
     common.run(command, source, env)
     inspection = inspect_macho(output.read_bytes(), target, filetype=2)
+    bek_dependency = inspect_browser_engine_kit_dependency(output.read_bytes()) if contract.get('browserEngineKitPolicy') else None
     result = {'passed': True, 'executableInspection': inspection, 'runtimeExecuted': False,
               'source': 'validation/link-smoke.cpp', 'executable': 'validation/link-smoke',
               'command': [str(argument) for argument in command],
               'linkingSha256': common.sha(directory / 'linking.json'),
               'monolithSha256': common.sha(directory / 'lib/libv8_monolith.a')}
+    if bek_dependency:
+        result['browserEngineKitDependency'] = bek_dependency
     (evidence / 'link-smoke.json').write_text(json.dumps(result, indent=2) + '\n')
     return result
 
@@ -307,7 +360,10 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
             expected = expected + (0,) * (3 - len(expected))
             if tuple(map(int, minimum.split('.'))) > expected:
                 raise ValueError('An archive member requires newer iOS than the SDK deployment contract')
-        (directory / 'linking.json').write_text(json.dumps(link_contract(target, pins, defines, frameworks, system_libraries, archives), indent=2) + '\n')
+        bek_policy = browser_engine_kit_policy(directory, source, frameworks, env)
+        if bek_policy:
+            (directory / 'validation/browser-engine-kit-policy.json').write_text(json.dumps(bek_policy, indent=2) + '\n')
+        (directory / 'linking.json').write_text(json.dumps(link_contract(target, pins, defines, frameworks, system_libraries, archives, bek_policy), indent=2) + '\n')
         smoke = link_smoke(directory, source, target, pins, env)
         (directory / 'args.gn').write_text(args)
         (directory / 'defines.json').write_text(json.dumps(defines, indent=2) + '\n')
