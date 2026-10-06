@@ -196,6 +196,15 @@ jobs:
           path: artifacts/${{ needs.detect.outputs.revision }}/
           if-no-files-found: error
           retention-days: 14
+      - name: Preserve failed SDK consumer diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (Node 24)
+        with:
+          archive: true
+          name: sdk-diagnostics-${{ matrix.target }}
+          path: artifacts/${{ needs.detect.outputs.revision }}/
+          if-no-files-found: ignore
+          retention-days: 3
   linux-arm-runtime:
     needs: [detect, build]
     if: needs.detect.outputs.should_build == 'true'
