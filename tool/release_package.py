@@ -32,6 +32,16 @@ def verify(root, item, key='path'):
         raise ValueError('artifact hash or size mismatch')
     return p
 
+def verify_windows_arm_probe(path):
+    data = path.read_bytes()
+    if len(data) < 64 or data[:2] != b'MZ':
+        raise ValueError('Windows ARM64 consumer PE evidence required')
+    offset = struct.unpack_from('<I', data, 0x3c)[0]
+    if offset < 64 or offset > len(data) - 24 or data[offset:offset + 4] != b'PE\0\0':
+        raise ValueError('Windows ARM64 consumer PE header invalid')
+    if struct.unpack_from('<H', data, offset + 4)[0] != 0xaa64:
+        raise ValueError('Windows ARM64 consumer must execute an ARM64 PE, not an emulated x64 PE')
+
 def verify_feature_profile(root, target):
     linking = json.loads(contained(root, target + '/linking.json').read_text())
     ios = target.startswith('ios-')
@@ -150,10 +160,13 @@ def archive(path, entries):
                     info.mtime = 0
                     tar.addfile(info, io.BytesIO(data))
 
-def package(inputs, pins_path, output, builder_revision):
+def package(inputs, pins_path, output, builder_revision, reuse_plan=None):
     if not re.fullmatch(r'[0-9a-f]{40}', builder_revision):
         raise ValueError('builder revision must be full Git SHA')
     pins = json.loads(pins_path.read_text())
+    if reuse_plan is not None:
+        from release_resume import validate_plan
+        validate_plan(reuse_plan, pins, builder_revision)
     if not re.fullmatch(r'\d+\.\d+\.\d+(?:\.\d+)?', pins['v8']['version']):
         raise ValueError('invalid V8 version')
     found = {}
@@ -196,9 +209,12 @@ def package(inputs, pins_path, output, builder_revision):
                 if report['probe'] not in ('validation/sdk-probe', 'validation/sdk-probe.exe'):
                     raise ValueError('unexpected SDK consumer probe path')
                 verify(manifest_path.parent, {'path': probe_name, 'sha256': report['probeSha256']})
+                if target == 'windows-arm64':
+                    verify_windows_arm_probe(contained(manifest_path.parent, probe_name))
                 allowed_extras.add(probe_name)
                 sidecar_name = probe_name + '.json'
-                if target == 'linux-arm64' and sidecar_name not in actual_files:
+                cross_target = target in ('linux-arm64', 'windows-arm64')
+                if cross_target and sidecar_name not in actual_files:
                     raise ValueError('cross-built SDK consumer compile proof required')
                 if sidecar_name in actual_files:
                     prior = json.loads(contained(manifest_path.parent, sidecar_name).read_text())
@@ -206,9 +222,9 @@ def package(inputs, pins_path, output, builder_revision):
                     for key in ('version', 'linkingSha256', 'librarySha256', 'libraries', 'probeSha256', 'probeSourceSha256', 'compiler', 'compileCommand', 'sysroot'):
                         if prior.get(key) != report.get(key):
                             raise ValueError('cross-built SDK consumer proof differs')
-                    if (target != 'linux-arm64' or prior.get('status') != 'compiled'
+                    if (not cross_target or prior.get('status') != 'compiled'
                             or prior.get('host') != report.get('compileHost')
-                            or prior.get('host', {}).get('os') != 'Linux'
+                            or prior.get('host', {}).get('os') != ('Linux' if target == 'linux-arm64' else 'Windows')
                             or prior.get('host', {}).get('machine', '').lower() not in ('x86_64', 'amd64')
                             or prior.get('nativeConsumerExecuted') is not False
                             or prior.get('cases') != ['official_api_compile', 'official_api_link']):
@@ -315,6 +331,9 @@ def package(inputs, pins_path, output, builder_revision):
     for target in TARGETS:
         root, manifest, entry, expected_files, proof_reports = found[target]
         entry = dict(entry)
+        entry['producerRevision'] = builder_revision if reuse_plan is None else reuse_plan['targets'][target]['producerRevision']
+        if reuse_plan is not None and 'reuseProvenance' in reuse_plan['targets'][target]:
+            entry['reuseProvenance'] = reuse_plan['targets'][target]['reuseProvenance']
         entries = {'pins.json': pins_bytes}
         for p in sorted((root / target).rglob('*')):
             if p.is_symlink():
@@ -367,5 +386,7 @@ if __name__ == '__main__':
     p.add_argument('--pins-file', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--builder-revision', required=True)
+    p.add_argument('--reuse-plan', type=Path)
     a = p.parse_args()
-    package(a.inputs, a.pins_file, a.output, a.builder_revision)
+    package(a.inputs, a.pins_file, a.output, a.builder_revision,
+            json.loads(a.reuse_plan.read_text()) if a.reuse_plan else None)

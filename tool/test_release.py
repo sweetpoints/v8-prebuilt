@@ -91,20 +91,26 @@ class ReleaseTests(unittest.TestCase):
             (root / target / 'args.gn').write_text(args)
             if target.startswith(('macos-', 'linux-', 'windows-')):
                 probe = root / target / 'validation' / ('sdk-probe.exe' if target.startswith('windows-') else 'sdk-probe')
-                probe.parent.mkdir(); probe.write_bytes(b'compiled-official-api-consumer')
+                probe.parent.mkdir()
+                payload = b'compiled-official-api-consumer'
+                if target == 'windows-arm64':
+                    pe = bytearray(152); pe[:2] = b'MZ'; struct.pack_into('<I', pe, 0x3c, 128)
+                    pe[128:132] = b'PE\0\0'; struct.pack_into('<H', pe, 132, 0xaa64)
+                    payload = bytes(pe)
+                probe.write_bytes(payload)
                 sysroot = ('/official/debian_bullseye_' + ('arm64' if target == 'linux-arm64' else 'amd64') + '-sysroot') if target.startswith('linux-') else None
                 command = ['official-compiler', 'consumer.cpp'] + (['--sysroot=' + sysroot] if sysroot else [])
                 libraries = [str(root / target / name) for name in sdk_libraries]
                 command += ['-Wl,--start-group', *libraries, '-Wl,--end-group'] if target.startswith('linux-') else libraries
                 os_name = {'macos': 'Darwin', 'linux': 'Linux', 'windows': 'Windows'}[target.split('-')[0]]
                 (root / target / 'sdk-smoke.json').write_text(json.dumps({'schemaVersion': 1, 'status': 'passed', 'version': self.pins['v8']['version'], 'librarySha256': manifest['targets'][target]['sha256'], 'linkingSha256': hashlib.sha256(linking_path.read_bytes()).hexdigest(), 'libraries': {name: hashlib.sha256((root / target / name).read_bytes()).hexdigest() for name in sdk_libraries}, 'probe': probe.relative_to(root / target).as_posix(), 'probeSha256': hashlib.sha256(probe.read_bytes()).hexdigest(), 'probeSourceSha256': hashlib.sha256(PROBE.encode()).hexdigest(), 'compiler': 'fixed official clang fixture', 'compileCommand': command, 'sysroot': sysroot, 'host': {'os': os_name, 'machine': 'arm64' if target.endswith('arm64') else 'x86_64'}, 'scope': 'official V8 API SDK consumer', 'nativeConsumerExecuted': True, 'cases': ['official_api_compile', 'official_api_link', 'official_api_execute']}))
-            if target == 'linux-arm64':
+            if target in ('linux-arm64', 'windows-arm64'):
                 path = root / target / 'sdk-smoke.json'
                 report = json.loads(path.read_text())
-                report['compileHost'] = {'os': 'Linux', 'machine': 'x86_64'}
+                report['compileHost'] = {'os': 'Linux' if target == 'linux-arm64' else 'Windows', 'machine': 'x86_64'}
                 path.write_text(json.dumps(report))
                 prior = dict(report, status='compiled', nativeConsumerExecuted=False, cases=['official_api_compile', 'official_api_link'], host=report['compileHost'])
-                (root / target / 'validation/sdk-probe.json').write_text(json.dumps(prior))
+                (root / target / ('validation/sdk-probe.json' if target == 'linux-arm64' else 'validation/sdk-probe.exe.json')).write_text(json.dumps(prior))
             entry = manifest['targets'][target]
             entry['artifactKind'] = 'v8-static-sdk'
             entry['validation'] = {'built': True, 'runtimeTested': False}
@@ -343,6 +349,58 @@ class ReleaseTests(unittest.TestCase):
         self.change_manifest('linux-arm64', lambda e: e.update(targetFiles=[v for v in e['targetFiles'] if v['path'] != 'linux-arm64/validation/sdk-probe.json']))
         with self.assertRaisesRegex(ValueError, 'compile proof required'):
             self.package()
+    def test_windows_cross_compile_proof_required(self):
+        target = 'windows-arm64'
+        (self.inputs / target / target / 'validation/sdk-probe.exe.json').unlink()
+        self.change_manifest(target, lambda e: e.update(targetFiles=[v for v in e['targetFiles'] if v['path'] != target + '/validation/sdk-probe.exe.json']))
+        with self.assertRaisesRegex(ValueError, 'compile proof required'):
+            self.package()
+    def change_windows_arm_probe(self, change):
+        target = 'windows-arm64'; path = self.inputs / target / target / 'validation/sdk-probe.exe'
+        data = bytearray(path.read_bytes()); change(data); path.write_bytes(data)
+        self.reindex_payload(target, 'validation/sdk-probe.exe')
+        for relative in ('sdk-smoke.json', 'validation/sdk-probe.exe.json'):
+            report_path = self.inputs / target / target / relative
+            report = json.loads(report_path.read_text()); report['probeSha256'] = hashlib.sha256(data).hexdigest()
+            report_path.write_text(json.dumps(report))
+            if relative.startswith('validation/'):
+                self.reindex_payload(target, relative)
+    def test_windows_arm_native_python_cannot_accept_emulated_x64_probe(self):
+        self.change_windows_arm_probe(lambda data: struct.pack_into('<H', data, 132, 0x8664))
+        with self.assertRaisesRegex(ValueError, 'not an emulated x64 PE'):
+            self.package()
+    def test_windows_arm_probe_invalid_pe_offset_rejected(self):
+        self.change_windows_arm_probe(lambda data: struct.pack_into('<I', data, 0x3c, 0xffffffff))
+        with self.assertRaisesRegex(ValueError, 'PE header invalid'):
+            self.package()
+    def test_windows_cross_compile_host_must_be_x64_windows(self):
+        target = 'windows-arm64'
+        path = self.inputs / target / target / 'validation/sdk-probe.exe.json'
+        value = json.loads(path.read_text()); value['host']['machine'] = 'arm64'; path.write_text(json.dumps(value))
+        self.reindex_payload(target, 'validation/sdk-probe.exe.json')
+        report_path = self.inputs / target / target / 'sdk-smoke.json'
+        report = json.loads(report_path.read_text()); report['compileHost'] = value['host']; report_path.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, 'cross-built SDK consumer proof'):
+            self.package()
+    def test_packaging_records_real_reused_producer_revision(self):
+        from release_resume import RUN_ID, PRODUCER, INPUTS, LOCK
+        from unittest.mock import patch
+        hashes = {name: 'a' * 64 for name in INPUTS}
+        plan = {'schemaVersion': 1, 'reuseRunId': RUN_ID, 'producerRevision': PRODUCER,
+                'packagingRevision': 'd' * 40, 'producerInputHashes': hashes, 'pins': self.pins, 'targets': {}}
+        for target in TARGETS:
+            origin = {'producerRevision': 'd' * 40}
+            if target != 'windows-arm64':
+                item = LOCK['v8-' + target]
+                origin = {'producerRevision': PRODUCER, 'reuseProvenance': {'runId': RUN_ID,
+                          'artifactId': item[0], 'artifactSha256': item[1], 'producerInputHashes': hashes}}
+            plan['targets'][target] = origin
+        with patch('release_resume.producer_inputs', return_value=hashes):
+            release = package(self.inputs, self.pins_path, self.root / 'resumed', 'd' * 40, plan)
+        self.assertEqual('d' * 40, release['builderRevision'])
+        self.assertEqual(PRODUCER, release['targets']['linux-x64']['producerRevision'])
+        self.assertEqual('d' * 40, release['targets']['windows-arm64']['producerRevision'])
+        self.assertEqual(RUN_ID, release['targets']['linux-arm64']['reuseProvenance']['runId'])
     def test_native_probe_hash_mismatch_rejected(self):
         path = self.inputs / 'linux-x64/linux-x64/sdk-smoke.json'
         report = json.loads(path.read_text()); report['probeSha256'] = '0' * 64

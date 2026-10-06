@@ -85,6 +85,8 @@ def publish(directory, repository, token, github=None):
     if 'bridge' in manifest:
         raise ValueError('pure SDK release must not contain a project bridge')
     for target, entry in manifest['targets'].items():
+        if not re.fullmatch(r'[0-9a-f]{40}', entry.get('producerRevision', '')):
+            raise ValueError('Actual target producer revision required')
         if entry.get('artifactKind') != 'v8-static-sdk':
             raise ValueError('pure V8 static SDK artifact required')
         validation = entry.get('validation', {})
@@ -115,7 +117,7 @@ def publish(directory, repository, token, github=None):
         release = gh.request(gh.base + '/releases', 'POST', {
             'tag_name': tag, 'target_commitish': manifest['builderRevision'], 'name': tag,
             'draft': True, 'prerelease': False,
-            'body': f"Official V8 source {manifest['v8']['revision']}. Ten target SDKs built by {manifest['builderRevision']}. See release-manifest.json and SHA256SUMS for provenance."
+            'body': f"Official V8 source {manifest['v8']['revision']}. Ten target SDKs assembled and packaged by {manifest['builderRevision']}. Each target's actual producerRevision and immutable reuse provenance are recorded in release-manifest.json. See SHA256SUMS for artifact integrity."
         })
     if release.get('prerelease') is not False or release.get('tag_name') != tag or release.get('target_commitish') != manifest['builderRevision']:
         raise ValueError('existing release identity differs')
