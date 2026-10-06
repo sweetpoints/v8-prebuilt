@@ -185,7 +185,7 @@ def _gn_values(source, out, label, key, run, gn, env, config=False):
 
 def _consumer_abi_options(flags):
     # Export ABI choices, never the build tree's absolute/relative include paths.
-    exact = {'-fno-rtti', '-frtti', '/GR-', '/GR', '-fno-exceptions', '-fexceptions',
+    exact = {'-fcomplete-member-pointers', '-fno-complete-member-pointers', '-fno-rtti', '-frtti', '/GR-', '/GR', '-fno-exceptions', '-fexceptions',
              '-fexperimental-relative-c++-abi-vtables', '-fno-experimental-relative-c++-abi-vtables',
              '-fshort-wchar', '-fno-short-wchar', '-fshort-enums', '-fno-short-enums',
              '-fsized-deallocation', '-fno-sized-deallocation'}
@@ -283,8 +283,9 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
         if path.is_symlink():
             raise ValueError('Runtime vendor header symlinks are not SDK payloads')
         headers['include/c++/config/' + name] = path
-    abi_options = _consumer_abi_options(
-        _gn_values(source, out, '//:v8_monolith', 'cflags_cc', run, gn, env))
+    actual_cflags = _gn_values(source, out, '//:v8_monolith', 'cflags', run, gn, env)
+    actual_cflags_cc = _gn_values(source, out, '//:v8_monolith', 'cflags_cc', run, gn, env)
+    abi_options = list(dict.fromkeys(_consumer_abi_options(actual_cflags + actual_cflags_cc)))
     official_libs = _gn_values(source, out, '//:v8_monolith', 'libs', run, gn, env)
     official_ldflags = _gn_values(source, out, '//:v8_monolith', 'ldflags', run, gn, env)
     # GN attaches these to final executables/shared libraries, not monolith.
@@ -335,7 +336,6 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
         if '-fuse-ld=lld' not in linker_flags:
             raise ValueError('Pinned Linux SDK requires the official LLD linker config')
         linking['linkOptions'].append('-fuse-ld=lld')
-        actual_cflags = _gn_values(source, out, '//:v8_monolith', 'cflags', run, gn, env)
         if '-pthread' in actual_cflags:
             linking['compileOptions'].append('-pthread')
         linking['sysrootRequirement'] = {

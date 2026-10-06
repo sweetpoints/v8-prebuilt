@@ -178,7 +178,7 @@ class DesktopTest(unittest.TestCase):
                         values = ['kernel32.lib'] if target.startswith('windows') else ['dl', 'pthread', 'rt']
                         return json.dumps({args[3]: {'libs': values}})
                     if args[4] == 'cflags':
-                        return json.dumps({args[3]: {'cflags': ['-pthread', '-Werror']}})
+                        return json.dumps({args[3]: {'cflags': ['-fcomplete-member-pointers', '-Werror'] + (['-pthread'] if target.startswith('linux') else [])}})
                     if args[3].startswith('//build/rust/std:'):
                         values = ['legacy_stdio_definitions.lib', 'ws2_32.lib'] if args[4] == 'ldflags' else []
                         return json.dumps({args[3]: {args[4]: values}})
@@ -188,6 +188,9 @@ class DesktopTest(unittest.TestCase):
                     return json.dumps({args[3]: {'outputs': ['//' + paths[args[3]].relative_to(source).as_posix()]}})
                 result = desktop.sdk_profile(source, out, target, self.pins(), ['V8_COMPRESS_POINTERS'], run, 'gn', {})
                 self.assertEqual(2, len(result['libraries']))
+                self.assertIn('-fcomplete-member-pointers', result['linking']['compileOptions'])
+                self.assertIn('-fcomplete-member-pointers', result['linking']['abiCompileOptions'])
+                self.assertNotIn('-Werror', result['linking']['compileOptions'])
                 if target.startswith('windows'):
                     self.assertIn('ws2_32.lib', result['linking']['systemLibraries'])
                     self.assertEqual(1, result['linking']['systemLibraries'].count('legacy_stdio_definitions.lib'))
