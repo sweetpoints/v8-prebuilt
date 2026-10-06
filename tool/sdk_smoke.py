@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
 
 # A build-time consumer fixture, not an application bridge or distributed API.
@@ -16,21 +17,33 @@ PROBE = r'''#include <cstdio>
 #include "libplatform/libplatform.h"
 #include "v8.h"
 int main(int argc, char** argv) {
+  auto stage = [](const char* name) {
+    std::fprintf(stderr, "sdk-stage: %s\n", name);
+    std::fflush(stderr);
+  };
+  stage("version");
   if (argc < 2 || std::strcmp(v8::V8::GetVersion(), argv[1])) return 2;
   if (argc > 2 && argv[2][0]) v8::V8::SetFlagsFromString(argv[2]);
+  stage("icu-initialize");
   if (!v8::V8::InitializeICUDefaultLocation(argv[0])) return 5;
+  stage("platform-create");
   auto platform = v8::platform::NewDefaultPlatform();
+  stage("platform-initialize");
   v8::V8::InitializePlatform(platform.get());
+  stage("v8-initialize");
   if (!v8::V8::Initialize()) return 3;
+  stage("allocator-create");
   std::unique_ptr<v8::ArrayBuffer::Allocator> allocator(
       v8::ArrayBuffer::Allocator::NewDefaultAllocator());
   v8::Isolate::CreateParams params;
   params.array_buffer_allocator = allocator.get();
+  stage("isolate-create");
   auto* isolate = v8::Isolate::New(params);
   bool passed = false;
   {
     v8::Isolate::Scope isolate_scope(isolate);
     v8::HandleScope handles(isolate);
+    stage("context-create");
     auto context = v8::Context::New(isolate);
     v8::Context::Scope context_scope(context);
     v8::TryCatch caught(isolate);
@@ -45,8 +58,10 @@ int main(int argc, char** argv) {
         "return Promise.resolve('V8 SDK'); })()");
     v8::Local<v8::Script> script;
     v8::Local<v8::Value> value;
+    stage("script-compile-run");
     if (v8::Script::Compile(context, code).ToLocal(&script) &&
         script->Run(context).ToLocal(&value) && value->IsPromise()) {
+      stage("microtasks");
       isolate->PerformMicrotaskCheckpoint();
       auto promise = value.As<v8::Promise>();
       if (promise->State() == v8::Promise::kFulfilled) {
@@ -55,8 +70,11 @@ int main(int argc, char** argv) {
       }
     }
   }
+  stage("isolate-dispose");
   isolate->Dispose();
+  stage("v8-dispose");
   v8::V8::Dispose();
+  stage("platform-dispose");
   v8::V8::DisposePlatform();
   if (!passed) return 4;
   std::puts("official-v8-api-sdk-consumer-passed");
@@ -121,7 +139,11 @@ def compile_probe(root, contract, compiler, output, source, sysroot=None):
         args += ['/I' + str(path) for path in include]
         args += ['/D' + value for value in contract['defines']]
         args += contract['compileOptions'] + [str(source), '/Fe:' + str(output)]
-        args += ['/link'] + [str(path) for path in libraries]
+        # V8's shared-capable archive may export symbols from this executable.
+        # Keep linker-generated import-library/EXP side products in the
+        # existing temporary consumer directory, outside the packaged SDK.
+        args += ['/link', '/IMPLIB:' + str(source.parent / 'consumer-import.lib')]
+        args += [str(path) for path in libraries]
         args += contract['linkOptions'] + contract['systemLibraries']
     elif style == 'clang++':
         args = [str(compiler), '-std=c++20']
@@ -213,8 +235,20 @@ def main():
             flags = contract.get('runtimeFlags', [])
             if not isinstance(flags, list) or any(not isinstance(value, str) for value in flags):
                 raise ValueError('invalid V8 runtime flags')
-            result = subprocess.run([str(probe), args.expected_version, ' '.join(flags)],
-                                    check=True, capture_output=True, text=True, timeout=30)
+            try:
+                result = subprocess.run([str(probe), args.expected_version, ' '.join(flags)],
+                                        check=True, capture_output=True, text=True, timeout=30)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                def diagnostic_text(value):
+                    return value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value or ''
+                stdout, stderr = diagnostic_text(error.stdout), diagnostic_text(error.stderr)
+                evidence.update(status='failed', nativeConsumerExecuted=True,
+                                returnCode=getattr(error, 'returncode', None),
+                                runtimeStdout=stdout, runtimeStderr=stderr)
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(json.dumps(evidence, indent=2) + '\n', encoding='utf-8')
+                print(stderr, end='', file=sys.stderr)
+                raise
             if result.stdout.strip() != 'official-v8-api-sdk-consumer-passed':
                 raise ValueError('native V8 API consumer did not confirm success')
             evidence.update(status='passed', nativeConsumerExecuted=True)
