@@ -40,7 +40,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.should_build == 'true'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 240
+    timeout-minutes: ${{ matrix.target == 'windows-arm64' && 360 || 240 }}
     strategy:
       fail-fast: false
       matrix:
