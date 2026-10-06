@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import re
+import struct
 import tarfile
 from sdk_smoke import PROBE
 
@@ -75,6 +76,68 @@ def verify_library_grouping(target, linking, command):
             or any(matches(argument, library) for argument in command[:start] + command[end + 1:]
                    for library in libraries)):
         raise ValueError('SDK archive rescan must enclose all libraries in contract order')
+
+def ios_bek_dependency(data):
+    if len(data) < 32 or struct.unpack_from('<I', data)[0] != 0xfeedfacf:
+        raise ValueError('iOS BrowserEngineKit consumer Mach-O evidence required')
+    cpu, _, kind, count, size = struct.unpack_from('<5I', data, 4)
+    if cpu != 0x100000c or kind != 2 or size > len(data) - 32:
+        raise ValueError('iOS BrowserEngineKit consumer Mach-O evidence required')
+    offset, found = 32, []
+    for _ in range(count):
+        if offset + 8 > 32 + size:
+            raise ValueError('invalid iOS consumer load commands')
+        command, length = struct.unpack_from('<II', data, offset)
+        if length < 8 or offset + length > 32 + size:
+            raise ValueError('invalid iOS consumer load commands')
+        if command in (0xc, 0x80000018, 0x8000001f, 0x20, 0x80000023):
+            if length < 24:
+                raise ValueError('invalid iOS consumer dylib load command')
+            name_offset = struct.unpack_from('<I', data, offset + 8)[0]
+            if not 24 <= name_offset < length:
+                raise ValueError('invalid iOS consumer dylib name')
+            name = data[offset + name_offset:offset + length].split(b'\0', 1)[0].decode('utf-8')
+            if Path(name).name == 'BrowserEngineKit':
+                if command != 0x80000018:
+                    raise ValueError('iOS BrowserEngineKit must load weakly')
+                found.append(name)
+        offset += length
+    if offset != 32 + size or len(found) != 1:
+        raise ValueError('exactly one iOS BrowserEngineKit weak dependency required')
+    return {'framework': 'BrowserEngineKit', 'loadCommand': 'LC_LOAD_WEAK_DYLIB', 'path': found[0]}
+
+def verify_ios_bek(root, target, linking, entry, indexed):
+    policy = linking.get('browserEngineKitPolicy')
+    expected = {'schemaVersion': 1, 'framework': 'BrowserEngineKit', 'linkage': 'weak',
+                'frameworkAvailableFromIOS': '17.4', 'requiredUndefinedSymbols': False,
+                'nmTool': 'third_party/llvm-build/Release+Asserts/bin/llvm-nm'}
+    if (not isinstance(policy, dict) or any(policy.get(key) != value or type(policy.get(key)) is not type(value)
+                                           for key, value in expected.items())):
+        raise ValueError('iOS BrowserEngineKit weak policy required')
+    policy_name = target + '/validation/browser-engine-kit-policy.json'
+    if policy_name not in indexed or json.loads(contained(root, policy_name).read_text()) != policy:
+        raise ValueError('indexed iOS BrowserEngineKit policy evidence differs')
+    archives = policy.get('checkedArchives')
+    libraries = linking.get('libraries', [])
+    if (not isinstance(archives, list) or not archives or any(not isinstance(item, dict) for item in archives)
+            or not isinstance(libraries, list) or any(not isinstance(name, str) for name in libraries)
+            or len(archives) != len(libraries)
+            or {item.get('path') for item in archives} != set(libraries)
+            or {path.relative_to(root / target).as_posix() for path in (root / target / 'lib').glob('*.a')} != set(libraries)):
+        raise ValueError('iOS BrowserEngineKit must check every SDK library')
+    for item in archives:
+        if not re.fullmatch('[0-9a-f]{64}', item.get('undefinedSymbolsSha256', '')):
+            raise ValueError('iOS BrowserEngineKit undefined-symbol evidence required')
+        verify(root, {'path': target + '/' + item['path'], 'sha256': item['sha256']})
+    options = linking.get('linkOptions', [])
+    if options.count('BrowserEngineKit') != 1 or options.index('BrowserEngineKit') == 0 or options[options.index('BrowserEngineKit') - 1] != '-weak_framework':
+        raise ValueError('iOS BrowserEngineKit weak link option required')
+    smoke = entry['linkSmoke']
+    if smoke.get('linkingSha256') != digest(contained(root, target + '/linking.json')):
+        raise ValueError('iOS BrowserEngineKit linking evidence differs')
+    executable = target + '/' + smoke.get('executable', '')
+    if executable not in indexed or smoke.get('browserEngineKitDependency') != ios_bek_dependency(contained(root, executable).read_bytes()):
+        raise ValueError('iOS BrowserEngineKit actual weak consumer evidence differs')
 
 def archive(path, entries):
     with path.open('xb') as raw:
@@ -186,6 +249,7 @@ def package(inputs, pins_path, output, builder_revision):
                 verify_library_grouping(target, linking, entry['linkSmoke'].get('command'))
             elif target.startswith('ios-'):
                 verify_library_grouping(target, linking, None)
+                verify_ios_bek(manifest_path.parent, target, linking, entry, indexed)
             if target.startswith(('macos-', 'linux-', 'windows-')):
                 report_path = contained(manifest_path.parent, target + '/sdk-smoke.json')
                 report = json.loads(report_path.read_text())

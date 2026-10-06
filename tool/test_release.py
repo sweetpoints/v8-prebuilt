@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import struct
 import unittest
 from release_package import TARGETS, package, verify_library_grouping
 from sdk_smoke import PROBE
@@ -70,6 +71,19 @@ class ReleaseTests(unittest.TestCase):
             linking = {'schemaVersion': 1, 'libraries': sdk_libraries, 'defines': [], 'compileOptions': [], 'linkOptions': [], 'systemLibraries': [], 'featureProfile': feature_profile}
             if target.startswith(('linux-', 'android-')):
                 linking['staticLibraryGrouping'] = 'rescan'
+            if target.startswith('ios-'):
+                policy = {'schemaVersion': 1, 'framework': 'BrowserEngineKit', 'linkage': 'weak',
+                          'frameworkAvailableFromIOS': '17.4', 'requiredUndefinedSymbols': False,
+                          'nmTool': 'third_party/llvm-build/Release+Asserts/bin/llvm-nm',
+                          'checkedArchives': [{'path': name, 'sha256': hashlib.sha256((root / target / name).read_bytes()).hexdigest(),
+                                               'undefinedSymbolsSha256': hashlib.sha256(b'no BEK references').hexdigest()} for name in sdk_libraries]}
+                linking['browserEngineKitPolicy'] = policy
+                linking['linkOptions'] = ['-weak_framework', 'BrowserEngineKit']
+                validation = root / target / 'validation'; validation.mkdir()
+                (validation / 'browser-engine-kit-policy.json').write_text(json.dumps(policy))
+                name = b'/System/Library/Frameworks/BrowserEngineKit.framework/BrowserEngineKit\0'
+                command = struct.pack('<6I', 0x80000018, 24 + len(name), 24, 0, 0, 0) + name
+                (validation / 'link-smoke').write_bytes(struct.pack('<8I', 0xfeedfacf, 0x100000c, 0, 2, 1, len(command), 0, 0) + command)
             linking_path.write_text(json.dumps(linking))
             args = 'v8_enable_i18n_support = true\nv8_enable_temporal_support = true\nicu_use_data_file = false\n'
             if target.startswith('ios-'):
@@ -104,7 +118,10 @@ class ReleaseTests(unittest.TestCase):
                 platform = 2 if target == 'ios-arm64' else 7
                 entry['validation']['linkTested'] = True
                 entry['binaryInspection'] = {'format': 'static-ar', 'architecture': 'arm64', 'platform': platform, 'objectCount': 1}
-                entry['linkSmoke'] = {'passed': True, 'runtimeExecuted': False, 'executableInspection': {'platform': platform}}
+                entry['linkSmoke'] = {'passed': True, 'runtimeExecuted': False, 'executableInspection': {'platform': platform},
+                                      'executable': 'validation/link-smoke', 'linkingSha256': hashlib.sha256(linking_path.read_bytes()).hexdigest(),
+                                      'browserEngineKitDependency': {'framework': 'BrowserEngineKit', 'loadCommand': 'LC_LOAD_WEAK_DYLIB',
+                                                                     'path': '/System/Library/Frameworks/BrowserEngineKit.framework/BrowserEngineKit'}}
             (root / 'manifest.json').write_text(json.dumps(manifest))
     def package(self, name='dist'):
         return package(self.inputs, self.pins_path, self.root / name, 'd' * 40)
@@ -226,6 +243,54 @@ class ReleaseTests(unittest.TestCase):
                     verify_library_grouping(target, {'staticLibraryGrouping': 'rescan'}, [])
                 with self.assertRaisesRegex(ValueError, 'unsupported for target'):
                     verify_library_grouping(target, {}, ['-Wl,--start-group', '-Wl,--end-group'])
+    def reindex_payload(self, target, relative):
+        path = self.inputs / target / target / relative
+        self.change_manifest(target, lambda entry: [item.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), size=path.stat().st_size)
+                                                   for item in entry['targetFiles'] if item['path'] == target + '/' + relative])
+    def change_ios_contract(self, change):
+        target = 'ios-arm64'; root = self.inputs / target / target
+        linking = json.loads((root / 'linking.json').read_text()); change(linking)
+        (root / 'linking.json').write_text(json.dumps(linking))
+        (root / 'validation/browser-engine-kit-policy.json').write_text(json.dumps(linking['browserEngineKitPolicy']))
+        self.reindex_file(target, root / 'linking.json')
+        self.reindex_payload(target, 'validation/browser-engine-kit-policy.json')
+        self.change_manifest(target, lambda entry: entry['linkSmoke'].update(linkingSha256=hashlib.sha256((root / 'linking.json').read_bytes()).hexdigest()))
+    def test_ios_bek_policy_cannot_require_symbols(self):
+        self.change_ios_contract(lambda linking: linking['browserEngineKitPolicy'].update(requiredUndefinedSymbols=True))
+        with self.assertRaisesRegex(ValueError, 'weak policy required'):
+            self.package()
+    def test_ios_bek_every_archive_must_be_checked(self):
+        self.change_ios_contract(lambda linking: linking['browserEngineKitPolicy'].update(checkedArchives=[]))
+        with self.assertRaisesRegex(ValueError, 'check every SDK library'):
+            self.package()
+    def test_ios_bek_checked_archive_hash_bound(self):
+        self.change_ios_contract(lambda linking: linking['browserEngineKitPolicy']['checkedArchives'][0].update(sha256='0' * 64))
+        with self.assertRaisesRegex(ValueError, 'hash or size'):
+            self.package()
+    def test_ios_bek_weak_link_option_required(self):
+        self.change_ios_contract(lambda linking: linking.update(linkOptions=['-framework', 'BrowserEngineKit']))
+        with self.assertRaisesRegex(ValueError, 'weak link option'):
+            self.package()
+    def test_ios_bek_policy_json_must_match_contract(self):
+        target = 'ios-arm64'
+        path = self.inputs / target / target / 'validation/browser-engine-kit-policy.json'
+        policy = json.loads(path.read_text()); policy['linkage'] = 'strong'; path.write_text(json.dumps(policy))
+        self.reindex_payload(target, 'validation/browser-engine-kit-policy.json')
+        with self.assertRaisesRegex(ValueError, 'policy evidence differs'):
+            self.package()
+    def test_ios_bek_real_strong_load_rejected_despite_weak_report(self):
+        target = 'ios-arm64'; path = self.inputs / target / target / 'validation/link-smoke'
+        data = bytearray(path.read_bytes()); struct.pack_into('<I', data, 32, 0xc); path.write_bytes(data)
+        self.reindex_payload(target, 'validation/link-smoke')
+        with self.assertRaisesRegex(ValueError, 'must load weakly'):
+            self.package()
+    def test_ios_bek_duplicate_actual_weak_dependencies_rejected(self):
+        target = 'ios-arm64'; path = self.inputs / target / target / 'validation/link-smoke'
+        data = bytearray(path.read_bytes()); command = data[32:]; data += command
+        struct.pack_into('<II', data, 16, 2, len(command) * 2); path.write_bytes(data)
+        self.reindex_payload(target, 'validation/link-smoke')
+        with self.assertRaisesRegex(ValueError, 'exactly one'):
+            self.package()
     def test_header_tamper_rejected_by_inventory(self):
         (self.inputs / TARGETS[0] / TARGETS[0] / 'include' / 'v8.h').write_text('modified')
         with self.assertRaisesRegex(ValueError, 'hash or size'):
