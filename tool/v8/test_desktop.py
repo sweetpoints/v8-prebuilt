@@ -192,6 +192,11 @@ class DesktopTest(unittest.TestCase):
                 self.assertIn('-fcomplete-member-pointers', result['linking']['abiCompileOptions'])
                 self.assertNotIn('-Werror', result['linking']['compileOptions'])
                 if target.startswith('windows'):
+                    # GN's Windows toolchain links directly with pinned LLD.
+                    # clang-cl otherwise defaults to Microsoft link.exe.
+                    self.assertIn('-fuse-ld=lld', result['linking']['compileOptions'])
+                    self.assertNotIn('-fuse-ld=lld', result['linking']['linkOptions'])
+                    self.assertEqual(['/machine:x64'], result['linking']['linkOptions'])
                     self.assertIn('ws2_32.lib', result['linking']['systemLibraries'])
                     self.assertEqual(1, result['linking']['systemLibraries'].count('legacy_stdio_definitions.lib'))
                 else:

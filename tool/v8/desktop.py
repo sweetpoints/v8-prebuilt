@@ -308,7 +308,7 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
         'compilerStyle': 'clang-cl' if os_name == 'windows' else 'clang++',
         'includeDirs': ['include', 'include/c++/config', 'include/c++/v1', 'include/c++abi'],
         'defines': defines,
-        'compileOptions': (['/std:c++20', '/MT', '/GR-', '/clang:-fno-exceptions', '--target=' + triple] if os_name == 'windows' else
+        'compileOptions': (['/std:c++20', '/MT', '/GR-', '/clang:-fno-exceptions', '-fuse-ld=lld', '--target=' + triple] if os_name == 'windows' else
                            ['-std=c++20', '-nostdinc++', '-fPIC', '-fno-rtti', '-fno-exceptions', '--target=' + triple]),
         'libraries': list(libraries),
         'linkOptions': ['/machine:' + cpu] if os_name == 'windows' else ['-nostdlib++', '--target=' + triple],
