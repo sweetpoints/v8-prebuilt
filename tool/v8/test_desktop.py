@@ -172,11 +172,16 @@ class DesktopTest(unittest.TestCase):
                         if target.startswith('linux'):
                             flags.append('-fexperimental-relative-c++-abi-vtables')
                         return json.dumps({args[3]: {'cflags_cc': flags}})
+                    if args[3] == '//build/config:default_libs':
+                        values = ['kernel32.lib'] if target.startswith('windows') else ['dl', 'pthread', 'rt']
+                        return json.dumps({args[3]: {'libs': values}})
+                    if args[4] == 'cflags':
+                        return json.dumps({args[3]: {'cflags': ['-pthread', '-Werror']}})
                     if args[3].startswith('//build/rust/std:'):
                         values = ['legacy_stdio_definitions.lib', 'ws2_32.lib'] if args[4] == 'ldflags' else []
                         return json.dumps({args[3]: {args[4]: values}})
                     if args[4] in ('libs', 'ldflags'):
-                        values = (['winmm', 'advapi32.lib'] if target.startswith('windows') else ['dl', 'm', 'pthread']) if args[4] == 'libs' else ['bcrypt.lib', 'kernel32.lib', 'legacy_stdio_definitions.lib', '/OPT:REF']
+                        values = (['winmm', 'advapi32.lib'] if target.startswith('windows') else ['m']) if args[4] == 'libs' else ['bcrypt.lib', 'kernel32.lib', 'legacy_stdio_definitions.lib', '/OPT:REF']
                         return json.dumps({args[3]: {args[4]: values}})
                     return json.dumps({args[3]: {'outputs': ['//' + paths[args[3]].relative_to(source).as_posix()]}})
                 result = desktop.sdk_profile(source, out, target, self.pins(), ['V8_COMPRESS_POINTERS'], run, 'gn', {})
@@ -185,7 +190,8 @@ class DesktopTest(unittest.TestCase):
                     self.assertIn('ws2_32.lib', result['linking']['systemLibraries'])
                     self.assertEqual(1, result['linking']['systemLibraries'].count('legacy_stdio_definitions.lib'))
                 else:
-                    self.assertEqual(['dl', 'm', 'pthread'], result['linking']['systemLibraries'])
+                    self.assertEqual(['m', 'dl', 'pthread', 'rt'], result['linking']['systemLibraries'])
+                    self.assertIn('-pthread', result['linking']['compileOptions'])
                 self.assertEqual(config, result['runtimeHeaders']['include/c++/config/__config_site'])
                 self.assertEqual(vendor, result['runtimeHeaders']['include/c++/config/__assertion_handler'])
                 self.assertEqual(target.startswith('linux'), '-fexperimental-relative-c++-abi-vtables' in result['linking']['compileOptions'])

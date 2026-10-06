@@ -287,6 +287,10 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
         _gn_values(source, out, '//:v8_monolith', 'cflags_cc', run, gn, env))
     official_libs = _gn_values(source, out, '//:v8_monolith', 'libs', run, gn, env)
     official_ldflags = _gn_values(source, out, '//:v8_monolith', 'ldflags', run, gn, env)
+    # GN attaches these to final executables/shared libraries, not monolith.
+    # In particular Linux Rust std needs default_libs' explicit pthread.
+    official_libs += _gn_values(source, out, '//build/config:default_libs',
+                               'libs', run, gn, env, config=True)
     # Static libraries do not necessarily inherit Rust's final-executable
     # configs. Read their resolved official values rather than copying names.
     for label in ('//build/rust/std:stdlib_dependent_libs',
@@ -319,6 +323,9 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
     linking['abiCompileOptions'] = abi_options
     linking['compileOptions'] = list(dict.fromkeys(linking['compileOptions'] + abi_options))
     if os_name == 'linux':
+        actual_cflags = _gn_values(source, out, '//:v8_monolith', 'cflags', run, gn, env)
+        if '-pthread' in actual_cflags:
+            linking['compileOptions'].append('-pthread')
         linking['sysrootRequirement'] = {
             'kind': 'chromium-linux-sysroot', 'architecture': 'amd64' if cpu == 'x64' else 'arm64',
             'distribution': 'debian-bullseye',
