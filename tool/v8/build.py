@@ -534,9 +534,24 @@ def sdk_rust_runtime(source, out, target, env):
                              'nativeObjects': objects, 'metadataMembersOmitted': skipped})
     if count == 0:
         raise ValueError('Rust SDK runtime has no native objects')
-    tool = source / ('third_party/llvm-build/Release+Asserts/bin/llvm-ar.exe' if target.startswith('windows-') else
-                     'third_party/llvm-build/Release+Asserts/bin/llvm-ar')
-    run([tool, ('--format=darwin' if target.startswith(('macos-', 'ios-')) else '--format=gnu'), 's', destination], source, env)
+    if target.startswith('windows-'):
+        # The official Windows Clang package ships lld-link, not llvm-ar.
+        # Match toolchain.gni's librarian mode and flatten the native-only
+        # archive into a complete indexed COFF library (never a thin archive).
+        tool = source / 'third_party/llvm-build/Release+Asserts/bin/lld-link.exe'
+        indexed = destination.with_name('v8_rust_runtime.indexed.lib')
+        indexed.unlink(missing_ok=True)
+        run([tool, '/lib', '/OUT:' + str(indexed), destination], source, env)
+        merged_objects = 0
+        for name, data in archive_members(indexed):
+            validate_rust_object(data, target)
+            merged_objects += 1
+        if merged_objects != count:
+            raise ValueError('Official Windows librarian lost Rust native objects')
+        indexed.replace(destination)
+    else:
+        tool = source / 'third_party/llvm-build/Release+Asserts/bin/llvm-ar'
+        run([tool, ('--format=darwin' if target.startswith(('macos-', 'ios-')) else '--format=gnu'), 's', destination], source, env)
     report = metadata / 'rust-runtime.json'
     report.write_text(json.dumps({'schemaVersion': 1, 'target': target, 'inputs': evidence,
                                  'nativeObjects': count, 'sha256': sha(destination)}, indent=2) + '\n')

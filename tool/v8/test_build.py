@@ -446,7 +446,10 @@ class RustSdkTests(unittest.TestCase):
                 for name in ('libtemporal_capi_lib.rlib', 'libstd_std.rlib'):
                     path = out/'obj'/name; path.write_bytes(self.ar([('lib.rmeta/', b'meta'), ('same.o/', self.object(target))])); inputs.append(path)
                 (out/'obj/v8_monolith.ninja').write_text('  rlibs = obj/libtemporal_capi_lib.rlib obj/libstd_std.rlib\n')
-                with patch.object(builder,'run') as command:
+                def index_library(arguments, *unused):
+                    if '/lib' in arguments:
+                        shutil.copyfile(arguments[-1], Path(str(arguments[2]).removeprefix('/OUT:')))
+                with patch.object(builder,'run',side_effect=index_library) as command:
                     runtime, report = builder.sdk_rust_runtime(source, out, target, {})
                 members = list(builder.archive_members(runtime))
                 self.assertEqual(len(members), 2)
@@ -457,9 +460,19 @@ class RustSdkTests(unittest.TestCase):
                 self.assertEqual(evidence['sha256'],builder.sha(runtime))
                 self.assertEqual([item['sha256'] for item in evidence['inputs']], [builder.sha(path) for path in inputs])
                 self.assertEqual([item['metadataMembersOmitted'] for item in evidence['inputs']], [1,1])
-                self.assertIn('s', command.call_args.args[0])
+                if target.startswith('windows-'):
+                    self.assertIn('/lib', command.call_args.args[0])
+                    self.assertTrue(str(command.call_args.args[0][0]).endswith('/lld-link.exe'))
+                    self.assertFalse(any('llvm-ar.exe' in str(arg) for arg in command.call_args.args[0]))
+                else: self.assertIn('s', command.call_args.args[0])
                 if target.startswith('macos-'): self.assertIn('--format=darwin', command.call_args.args[0])
-                else: self.assertIn('--format=gnu', command.call_args.args[0])
+                if target.startswith('windows-'):
+                    def discard_objects(arguments, *unused):
+                        Path(str(arguments[2]).removeprefix('/OUT:')).write_bytes(b'!<arch>\n')
+                    with patch.object(builder, 'run', side_effect=discard_objects), \
+                         self.assertRaisesRegex(ValueError, 'lost Rust native objects'):
+                        builder.sdk_rust_runtime(source, out, target, {})
+                if target.startswith('linux-'): self.assertIn('--format=gnu', command.call_args.args[0])
 
     def test_exact_target_list_excludes_host_libraries_and_checks_source_scope(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -476,17 +489,18 @@ class RustSdkTests(unittest.TestCase):
         tools = os.environ.get('V8_SDK_TEST_LLVM_DIR')
         clang = Path(tools) / 'clang' if tools else Path(shutil.which('clang') or '/missing/clang')
         ar = Path(tools) / 'llvm-ar' if tools else Path(shutil.which('llvm-ar') or '/missing/llvm-ar')
+        lld = Path(tools) / 'lld' if tools else Path(shutil.which('lld') or '/missing/lld')
         nm = Path(tools) / 'llvm-nm' if tools else Path(shutil.which('llvm-nm') or '/missing/llvm-nm')
-        if not all(path.is_file() for path in (clang, ar, nm)):
+        if not all(path.is_file() for path in (clang, ar, nm, lld)):
             self.skipTest('Real LLVM fixture requires clang/llvm-ar/llvm-nm or V8_SDK_TEST_LLVM_DIR')
         triples = {'linux-x64':'x86_64-unknown-linux-gnu', 'windows-x64':'x86_64-pc-windows-msvc',
                    'macos-arm64':'arm64-apple-macos13.0'}
         with tempfile.TemporaryDirectory() as directory:
             source=Path(directory); out=source/'out/sdk';(out/'obj').mkdir(parents=True)
             bin=source/'third_party/llvm-build/Release+Asserts/bin';bin.mkdir(parents=True)
-            for name in ('llvm-ar','llvm-ar.exe'):
-                try: (bin/name).symlink_to(ar)
-                except OSError: shutil.copyfile(ar,bin/name)
+            for name, original in (('llvm-ar', ar), ('lld-link.exe', lld)):
+                try: (bin/name).symlink_to(original)
+                except OSError: shutil.copyfile(original,bin/name)
             def execute(arguments,cwd,env=None,capture=False):
                 result = subprocess.run([str(value) for value in arguments],cwd=cwd,env=env,
                                         text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
