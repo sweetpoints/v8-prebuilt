@@ -99,6 +99,14 @@ def depot_command(depot, name):
     return depot / (name + ('.bat' if os.name == 'nt' else ''))
 
 
+def initialize_windows_depot(depot, env):
+    platform_module('desktop').initialize_depot_windows(depot, env, run)
+    # gclient downloads multiple DEPS concurrently. Initialize the fixed
+    # gsutil package once before those subprocesses compete for its 30-second
+    # bootstrap lock; keep the upstream wrapper, checksums and locking intact.
+    run([depot_command(depot, 'gsutil.py'), 'version'], depot, env)
+
+
 def require_host(target):
     if target not in TARGETS:
         raise ValueError('Unsupported V8 target: ' + target)
@@ -196,7 +204,7 @@ def bootstrap(cache, target, pins, reuse=False):
     run(['git', 'fetch', '--depth', '1', 'origin', pins['depotTools']['revision']], depot)
     run(['git', 'checkout', '--detach', pins['depotTools']['revision']], depot)
     if target.startswith('windows-'):
-        platform_module('desktop').initialize_depot_windows(depot, env, run)
+        initialize_windows_depot(depot, env)
     else:
         initialize_depot(depot, env)
     # Android ABIs share the fixed Linux-host DEPS checkout but have independent

@@ -80,6 +80,20 @@ class BuildContractTests(unittest.TestCase):
             archive(b'BC\xc0\xde' + bytes(28))
             with self.assertRaisesRegex(ValueError, 'native'): builder.inspect_apple_android_archive(path, 'macos-arm64')
 
+    def test_windows_gsutil_is_bootstrapped_serially_with_the_official_wrapper(self):
+        depot = Path('/fixed/depot'); env = {'DEPOT_TOOLS_UPDATE': '0'}; calls = []
+        with patch.object(builder, 'platform_module') as module, \
+             patch.object(builder, 'run', side_effect=lambda args, cwd, environment: calls.append(('gsutil', args, cwd, environment))), \
+             patch.object(builder.os, 'name', 'nt'):
+            module.return_value.initialize_depot_windows.side_effect = lambda *args: calls.append(('initialize', args))
+            builder.initialize_windows_depot(depot, env)
+        self.assertEqual([call[0] for call in calls], ['initialize', 'gsutil'])
+        self.assertEqual(calls[1][1:], ([depot / 'gsutil.py.bat', 'version'], depot, env))
+        with patch.object(builder, 'platform_module'), \
+             patch.object(builder, 'run', side_effect=subprocess.CalledProcessError(1, 'fixed gsutil')):
+            with self.assertRaises(subprocess.CalledProcessError):
+                builder.initialize_windows_depot(depot, env)
+
     def test_source_version_uses_canonical_nonzero_patch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); (root / 'include').mkdir()
