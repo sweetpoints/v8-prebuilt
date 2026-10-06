@@ -151,7 +151,18 @@ jobs:
               target = '${{ matrix.target }}'
               if target.startswith('linux-'):
                   arch = 'arm64' if target == 'linux-arm64' else 'amd64'
-                  sysroot = paths[0].parents[4] / ('build/linux/debian_bullseye_' + arch + '-sysroot')
+                  # Both Linux targets use build.py's fixed linux-x64 checkout.
+                  source = pathlib.Path(os.environ['V8_CACHE_ROOT']) / '${{ needs.detect.outputs.revision }}' / 'linux-x64' / 'v8'
+                  revision = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+                  if revision != '${{ needs.detect.outputs.revision }}' or not (source / 'include/v8-version.h').is_file():
+                      raise ValueError('Fixed official Linux source identity differs')
+                  compiler = source / ('third_party/llvm-build/Release+Asserts/bin/' + name)
+                  if compiler.resolve() != paths[0].resolve():
+                      raise ValueError('Consumer compiler differs from the fixed Linux checkout')
+                  sysroot = source / ('build/linux/debian_bullseye_' + arch + '-sysroot')
+                  print('Fixed Linux consumer source:', source.resolve())
+                  print('Fixed Linux consumer compiler:', compiler.resolve())
+                  print('Fixed Linux consumer sysroot:', sysroot.resolve())
                   if not sysroot.is_dir():
                       raise ValueError('Fixed official Chromium Linux sysroot missing')
                   stream.write('V8_SDK_SYSROOT=' + str(sysroot.resolve()) + '\n')
