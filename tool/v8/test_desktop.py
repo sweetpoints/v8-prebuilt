@@ -183,7 +183,7 @@ class DesktopTest(unittest.TestCase):
                         values = ['legacy_stdio_definitions.lib', 'ws2_32.lib'] if args[4] == 'ldflags' else []
                         return json.dumps({args[3]: {args[4]: values}})
                     if args[4] in ('libs', 'ldflags'):
-                        values = (['winmm', 'advapi32.lib'] if target.startswith('windows') else ['m']) if args[4] == 'libs' else ['bcrypt.lib', 'kernel32.lib', 'legacy_stdio_definitions.lib', '/OPT:REF']
+                        values = (['winmm', 'advapi32.lib'] if target.startswith('windows') else []) if args[4] == 'libs' else ['bcrypt.lib', 'kernel32.lib', 'legacy_stdio_definitions.lib', '/OPT:REF']
                         return json.dumps({args[3]: {args[4]: values}})
                     return json.dumps({args[3]: {'outputs': ['//' + paths[args[3]].relative_to(source).as_posix()]}})
                 result = desktop.sdk_profile(source, out, target, self.pins(), ['V8_COMPRESS_POINTERS'], run, 'gn', {})
@@ -192,7 +192,8 @@ class DesktopTest(unittest.TestCase):
                     self.assertIn('ws2_32.lib', result['linking']['systemLibraries'])
                     self.assertEqual(1, result['linking']['systemLibraries'].count('legacy_stdio_definitions.lib'))
                 else:
-                    self.assertEqual(['m', 'dl', 'pthread', 'rt'], result['linking']['systemLibraries'])
+                    self.assertEqual(['dl', 'pthread', 'rt', 'm'], result['linking']['systemLibraries'])
+                    self.assertEqual(1, result['linking']['systemLibraries'].count('m'))
                     self.assertIn('-pthread', result['linking']['compileOptions'])
                     self.assertIn('-fuse-ld=lld', result['linking']['linkOptions'])
                     self.assertFalse(any('/private/' in option for option in result['linking']['linkOptions']))
@@ -213,6 +214,12 @@ class DesktopTest(unittest.TestCase):
                 self.assertIn('/GR-' if target.startswith('windows') else '-fno-rtti', flags)
                 self.assertIn('/clang:-fno-exceptions' if target.startswith('windows') else '-fno-exceptions', flags)
                 if target.startswith('linux'):
+                    def with_math(args, *a, **kw):
+                        if args[3] == '//:v8_monolith' and args[4] == 'libs':
+                            return json.dumps({args[3]: {'libs': ['m']}})
+                        return run(args, *a, **kw)
+                    math_result = desktop.sdk_profile(source, out, target, self.pins(), [], with_math, 'gn', {})
+                    self.assertEqual(1, math_result['linking']['systemLibraries'].count('m'))
                     def without_lld(args, *a, **kw):
                         if args[3] == '//build/config/compiler:linker':
                             return json.dumps({args[3]: {}})

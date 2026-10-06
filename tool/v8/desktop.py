@@ -323,6 +323,11 @@ def sdk_profile(source, out, target, pins, defines, run, gn, env):
     linking['abiCompileOptions'] = abi_options
     linking['compileOptions'] = list(dict.fromkeys(linking['compileOptions'] + abi_options))
     if os_name == 'linux':
+        # Pinned Clang++ Linux ToolChain adds libm even with -nostdlib++.
+        # Record it explicitly: consumers may resolve clang++ to clang's
+        # underlying executable, which otherwise loses this C++ driver default.
+        if 'm' not in linking['systemLibraries']:
+            linking['systemLibraries'].append('m')
         # The SDK is built with the pinned LLD toolchain. Clang's Linux
         # default selects host GNU ld, bypassing that tested toolchain.
         linker_flags = _gn_values(source, out, '//build/config/compiler:linker',
