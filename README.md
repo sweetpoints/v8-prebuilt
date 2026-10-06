@@ -110,6 +110,9 @@ establish final GLIBC compatibility; the linked consumer probe is checked
 separately. Linux ARM64 build success is separate from native execution. Windows uses an installed Visual
 Studio toolchain with `DEPOT_TOOLS_WIN_TOOLCHAIN=0`, official clang and a static
 CRT; the CI runner version is not a promise of a minimum Windows version.
+Windows ARM64 is cross-compiled on a Windows x64 runner. Its consumer executable
+is compiled and linked on x64, then executed on a separate Windows ARM64 runner;
+the ARM64 runner does not compile V8.
 iOS requires a full Xcode installation on Darwin ARM64, produces static SDK
 archives, and disables JIT and WebAssembly. All targets produce static V8 SDKs. Use their recorded libraries, feature
 definitions, C++ runtime dependencies and linker flags when compiling an embedder.
