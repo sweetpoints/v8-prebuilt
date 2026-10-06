@@ -334,6 +334,10 @@ def package(inputs, pins_path, output, builder_revision, reuse_plan=None):
         entry['producerRevision'] = builder_revision if reuse_plan is None else reuse_plan['targets'][target]['producerRevision']
         if reuse_plan is not None and 'reuseProvenance' in reuse_plan['targets'][target]:
             entry['reuseProvenance'] = reuse_plan['targets'][target]['reuseProvenance']
+        if reuse_plan is not None and reuse_plan.get('publishOnlySourceRunId') and target in ('linux-arm64', 'windows-arm64'):
+            runtime = reuse_plan['publishAssets']['linux-arm-runtime' if target == 'linux-arm64' else 'windows-arm-runtime']
+            entry['runtimeReuseProvenance'] = {'runId': reuse_plan['publishOnlySourceRunId'],
+                'artifactId': runtime['id'], 'artifactSha256': runtime['sha256']}
         entries = {'pins.json': pins_bytes}
         for p in sorted((root / target).rglob('*')):
             if p.is_symlink():

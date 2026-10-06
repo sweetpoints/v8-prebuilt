@@ -27,13 +27,19 @@ class ResumeTests(unittest.TestCase):
         self.lock['stable-pins']=(resume.LOCK['stable-pins'][0],hashlib.sha256(self.zip).hexdigest(),len(self.zip))
         self.jobs=[{'name':'build ('+target+', runner, 4, x64)','conclusion':'success'} for target in resume.TARGETS if target!='windows-arm64']
         self.run={'head_sha':resume.PRODUCER,'status':'completed','run_attempt':1,'conclusion':'cancelled'}
+        self.publish_run={'head_sha':resume.ARM_PRODUCER,'status':'completed','run_attempt':1,'conclusion':'failure'}
+        self.publish_jobs=[{'name':name,'conclusion':'success'} for name in ('detect','reuse','windows-arm-runtime','linux-arm-runtime','build (windows-arm64, windows-2025, 4, x64)')]
         self.items={}
         for name,(identifier,sha,size) in self.lock.items():
             self.items[identifier]={'id':identifier,'name':name,'digest':'sha256:'+sha,'size_in_bytes':size,'expired':False,'workflow_run':{'id':resume.RUN_ID,'head_sha':resume.PRODUCER}}
+        for name,(identifier,sha,size) in resume.PUBLISH_LOCK.items():
+            self.items[identifier]={'id':identifier,'name':name,'digest':'sha256:'+sha,'size_in_bytes':size,'expired':False,'workflow_run':{'id':resume.PUBLISH_RUN,'head_sha':resume.ARM_PRODUCER}}
         class API:
             base='https://api.github.com/repos/example/sdk'
             def request(inner,url,content_type=None,accept=None):
                 if url.endswith('/zip'):return self.zip
+                if f'/actions/runs/{resume.PUBLISH_RUN}' in url:
+                    return {'jobs':self.publish_jobs} if '/jobs?' in url else self.publish_run
                 if '/jobs?' in url:return {'jobs':self.jobs}
                 if '/actions/runs/' in url:return self.run
                 return self.items[int(url.rsplit('/',1)[1])]
@@ -135,3 +141,29 @@ class ResumeTests(unittest.TestCase):
         publish=workflow.split('  publish:',1)[1]
         self.assertIn('name: v8-windows-arm64\n          path: inputs/v8-windows-arm64',publish)
         self.assertIn("if: needs.detect.outputs.reuse_run_id == ''\n        with:\n          pattern: v8-*",publish)
+    def publish_plan(self):
+        with patch.object(resume,'LOCK',self.lock),patch.object(resume,'producer_inputs',return_value=self.hashes):
+            return resume.publish_plan(self.api,self.root,'b'*40)
+    def test_publish_only_reuses_tenth_sdk_and_passed_runtime_proof(self):
+        value=self.publish_plan()
+        self.assertEqual(resume.ARM_PRODUCER,value['targets']['windows-arm64']['producerRevision'])
+        self.assertEqual(resume.PRODUCER,value['targets']['linux-arm64']['producerRevision'])
+        self.assertEqual(resume.PUBLISH_RUN,value['publishOnlySourceRunId'])
+        with patch.object(resume,'LOCK',self.lock),patch.object(resume,'producer_inputs',return_value=self.hashes):
+            resume.validate_plan(value,self.pins,'b'*40)
+    def test_publish_only_never_accepts_failed_arm_runtime(self):
+        self.publish_jobs[2]['conclusion']='failure'
+        with self.assertRaisesRegex(ValueError,'runtime stage'):self.publish_plan()
+    def test_publish_only_changed_source_revision_or_artifact_rejected(self):
+        self.publish_run['head_sha']='0'*40
+        with self.assertRaisesRegex(ValueError,'source run'):self.publish_plan()
+        self.publish_run['head_sha']=resume.ARM_PRODUCER
+        self.items[resume.PUBLISH_LOCK['windows-arm-runtime'][0]]['digest']='sha256:'+'0'*64
+        with self.assertRaisesRegex(ValueError,'artifact identity'):self.publish_plan()
+    def test_publish_only_workflow_has_no_compile_or_runtime_steps(self):
+        workflow=(Path(__file__).parents[1]/'.github/workflows/release.yml').read_text()
+        job=workflow.split('  publish-only:',1)[1]
+        self.assertNotIn('tool/v8/build.py',job)
+        self.assertNotIn('tool/sdk_smoke.py',job)
+        self.assertIn('publish-plan',job);self.assertIn('publish-download',job)
+        self.assertIn("if: inputs.publish_only_source_run == ''",workflow)

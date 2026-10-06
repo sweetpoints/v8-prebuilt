@@ -4,6 +4,11 @@ on:
     - cron: '17 */6 * * *'
   workflow_dispatch:
     inputs:
+      publish_only_source_run:
+        description: Package only from the reviewed complete build (37484248844)
+        type: string
+        required: false
+        default: ""
       reuse_run_id:
         description: Reviewed immutable run to resume (37449592798)
         type: string
@@ -17,6 +22,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   detect:
+    if: inputs.publish_only_source_run == ''
     runs-on: ubuntu-26.04
     outputs:
       should_build: ${{ steps.resume.outputs.should_build || steps.stable.outputs.should_build }}
@@ -386,3 +392,36 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 tool/release_publish.py --directory dist --repository "$GITHUB_REPOSITORY"
+  publish-only:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_only_source_run != '' && inputs.reuse_run_id == ''
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Verify exact source producers and all successful SDK/runtime stages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_SOURCE_RUN: ${{ inputs.publish_only_source_run }}
+        run: python tool/release_resume.py publish-plan --repository "$GITHUB_REPOSITORY" --run-id "$PUBLISH_SOURCE_RUN" --builder-revision "$GITHUB_SHA"
+      - name: Download immutable SDKs and already passed native runtime evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_SOURCE_RUN: ${{ inputs.publish_only_source_run }}
+        run: python tool/release_resume.py publish-download --repository "$GITHUB_REPOSITORY" --run-id "$PUBLISH_SOURCE_RUN" --output inputs
+      - name: Package all ten verified SDKs with their actual producer revisions
+        run: |
+          python -m unittest discover -s tests -p 'test_*.py'
+          python -m unittest discover -s tool -p 'test_*.py'
+          python -m unittest discover -s tool/v8 -p 'test_*.py'
+          python tool/release_package.py --inputs inputs --pins-file stable-pins.json --output dist --builder-revision "$GITHUB_SHA" --reuse-plan reuse-plan.json
+      - name: Publish immutable complete SDK release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tool/release_publish.py --directory dist --repository "$GITHUB_REPOSITORY"
