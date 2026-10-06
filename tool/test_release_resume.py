@@ -130,3 +130,8 @@ class ResumeTests(unittest.TestCase):
         self.assertIn('fetch-depth: 0',detect)
         self.assertIn('fetch-depth: 0',publish)
         self.assertIn('actions: read',workflow)
+    def test_single_new_sdk_download_has_explicit_artifact_parent(self):
+        workflow=(Path(__file__).parents[1]/'.github/workflows/release.yml').read_text()
+        publish=workflow.split('  publish:',1)[1]
+        self.assertIn('name: v8-windows-arm64\n          path: inputs/v8-windows-arm64',publish)
+        self.assertIn("if: needs.detect.outputs.reuse_run_id == ''\n        with:\n          pattern: v8-*",publish)
