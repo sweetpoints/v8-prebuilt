@@ -140,7 +140,7 @@ jobs:
         if: startsWith(matrix.target, 'macos-') || startsWith(matrix.target, 'linux-') || startsWith(matrix.target, 'windows-')
         run: |
           python - <<'PYTHON'
-          import os, pathlib, subprocess
+          import os, pathlib, subprocess, sys
           name = 'clang-cl.exe' if os.name == 'nt' else 'clang++'
           paths = list(pathlib.Path(os.environ['V8_CACHE_ROOT']).rglob('third_party/llvm-build/Release+Asserts/bin/' + name))
           if len(paths) != 1:
@@ -159,6 +159,9 @@ jobs:
                   compiler = source / ('third_party/llvm-build/Release+Asserts/bin/' + name)
                   if compiler.resolve() != paths[0].resolve():
                       raise ValueError('Consumer compiler differs from the fixed Linux checkout')
+                  # Reassert the pinned installer's SHA-verified sysroot immediately
+                  # before consumer linking, independently of the native build phase.
+                  subprocess.run([sys.executable, str(source / 'build/linux/sysroot_scripts/install-sysroot.py'), '--arch=' + arch], check=True)
                   sysroot = source / ('build/linux/debian_bullseye_' + arch + '-sysroot')
                   print('Fixed Linux consumer source:', source.resolve())
                   print('Fixed Linux consumer compiler:', compiler.resolve())
