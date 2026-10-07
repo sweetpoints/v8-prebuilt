@@ -1,0 +1,9 @@
+# Producer recipes have identical bytes on all checkout hosts.
+*.py text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.gn text eol=lf
+*.gni text eol=lf
+*.md text eol=lf
+.gitattributes text eol=lf
