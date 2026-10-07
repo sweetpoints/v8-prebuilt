@@ -17,6 +17,9 @@ STABLE_URL = 'https://chromiumdash.appspot.com/fetch_releases?channel=Stable&pla
 TARGETS = {'android-arm64', 'android-x64', 'ios-arm64', 'ios-simulator-arm64',
            'macos-arm64', 'macos-x64', 'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64'}
 SHA = re.compile(r'[0-9a-f]{40}')
+JSON_LIMIT = 4 * 1024 * 1024
+# Ten full SDK file inventories exceed ordinary GitHub API JSON responses.
+MANIFEST_LIMIT = 32 * 1024 * 1024
 
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
@@ -31,18 +34,18 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
-def fetch(url, token=None, accept='application/json'):
+def fetch(url, token=None, accept='application/json', *, max_bytes=JSON_LIMIT):
     headers = {'Accept': accept, 'User-Agent': 'legado-v8-stable-detector'}
     if token:
         headers['Authorization'] = f'Bearer {token}'
     opener = urllib.request.build_opener(SafeRedirect())
     with opener.open(urllib.request.Request(url, headers=headers), timeout=60) as response:
-        return response.read(4 * 1024 * 1024 + 1)
+        return response.read(max_bytes + 1)
 
 
 def read_json(url, token=None):
     data = fetch(url, token)
-    if len(data) > 4 * 1024 * 1024:
+    if len(data) > JSON_LIMIT:
         raise ValueError('remote response exceeds limit')
     return json.loads(data)
 
@@ -144,10 +147,15 @@ def published_release(repository, tag, token):
         asset_id = assets[0].get('id')
         if type(asset_id) is not int or asset_id <= 0:
             raise ValueError('invalid release manifest asset ID')
+        size = assets[0].get('size')
+        if type(size) is not int or not 0 < size <= MANIFEST_LIMIT:
+            raise ValueError('invalid or oversized release manifest asset size')
         data = fetch(f'https://api.github.com/repos/{repository}/releases/assets/{asset_id}',
-                     token, 'application/octet-stream')
-        if len(data) > 4 * 1024 * 1024:
+                     token, 'application/octet-stream', max_bytes=MANIFEST_LIMIT)
+        if len(data) > MANIFEST_LIMIT:
             raise ValueError('release manifest exceeds limit')
+        if len(data) != size:
+            raise ValueError('release manifest download size differs from asset metadata')
         manifest = json.loads(data)
     return release, manifest
 
