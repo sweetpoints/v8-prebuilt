@@ -141,6 +141,38 @@ class StableDetectorTest(unittest.TestCase):
                     with self.assertRaises(urllib.error.HTTPError):
                         d.published_release('owner/repo', 'v8-' + VERSION, None)
 
+    def test_complete_sdk_manifest_larger_than_api_json_limit_skips_build(self):
+        payload = json.dumps(manifest()).encode() + b' ' * (5 * 1024 * 1024)
+        rel = release()
+        for asset in rel['assets']:
+            if asset['name'] == 'release-manifest.json':
+                asset.update(id=123, size=len(payload))
+        with patch.object(d, 'read_json', return_value=rel), \
+                patch.object(d, 'fetch', return_value=payload) as fetch:
+            actual, parsed = d.published_release('owner/repo', 'v8-' + VERSION, None)
+            self.assertEqual(d.release_decision(actual, parsed, VERSION, REV), (False, 'published'))
+            self.assertEqual(fetch.call_args.kwargs['max_bytes'], d.MANIFEST_LIMIT)
+
+    def test_manifest_size_bound_and_truncated_download_rejected(self):
+        for size in (None, True, 0, -1, d.MANIFEST_LIMIT + 1):
+            rel = {'assets': [{'name': 'release-manifest.json', 'id': 123, 'size': size}]}
+            with patch.object(d, 'read_json', return_value=rel), patch.object(d, 'fetch') as fetch:
+                with self.assertRaisesRegex(ValueError, 'asset size'):
+                    d.published_release('owner/repo', 'v8-' + VERSION, None)
+                fetch.assert_not_called()
+        rel = {'assets': [{'name': 'release-manifest.json', 'id': 123, 'size': 100}]}
+        for payload, reason in ((b'{}', 'size differs'),
+                                (b' ' * (d.MANIFEST_LIMIT + 1), 'exceeds limit')):
+            with patch.object(d, 'read_json', return_value=rel), \
+                    patch.object(d, 'fetch', return_value=payload):
+                with self.assertRaisesRegex(ValueError, reason):
+                    d.published_release('owner/repo', 'v8-' + VERSION, None)
+
+    def test_ordinary_api_json_retains_smaller_limit(self):
+        with patch.object(d, 'fetch', return_value=b' ' * (d.JSON_LIMIT + 1)):
+            with self.assertRaisesRegex(ValueError, 'response exceeds limit'):
+                d.read_json('https://api.github.com/example')
+
     def test_end_to_end_pins_immutable_header_and_race_rejects(self):
         rows = [stable(), [{'milestone': 154, 'v8_branch': '15.4'}], stable()]
         with patch.object(d, 'read_json', side_effect=rows), patch.object(d, 'branch_revision', return_value=REV), \
