@@ -38,6 +38,9 @@ LOCK = {
  'stable-pins': (11406980088,'cc6dd554314269c8fd327e0974511d1e815f03dc009a9383f1613624276d8635',544),
 }
 
+REVIEWED_STABLE = json.loads(Path(__file__).with_name('resume-37511114581.json').read_text())
+STABLE_RUN_ID = REVIEWED_STABLE['runId']
+
 def sha(data): return hashlib.sha256(data).hexdigest()
 def producer_inputs(root,revision=PRODUCER):
     result = {}
@@ -136,6 +139,8 @@ def download(gh,plan_value,output,probe_only=False,only_target=None):
             elif entry.get('targetConfig')!=config:raise ValueError('Reused target configuration differs')
 
 def validate_plan(value,pins,builder_revision):
+    if value.get('reuseRunId') == STABLE_RUN_ID:
+        return validate_stable_plan(value, pins, builder_revision)
     if value.get('publishOnlySourceRunId') not in (None,PUBLISH_RUN):raise ValueError('Unreviewed publish-only run')
     if value.get('publishOnlySourceRunId')==PUBLISH_RUN:
         for name,(identifier,checksum,size) in PUBLISH_LOCK.items():
@@ -203,18 +208,147 @@ def download_publish(gh,value,output):
             shutil.copyfile(path,directory/'validation'/path.name)
         shutil.rmtree(output/runtime)
 
+def snapshot_inputs(root, revision):
+    """Read every producer input at its actual immutable Git commit."""
+    if not re.fullmatch('[0-9a-f]{40}', revision):
+        raise ValueError('Full producer revision required')
+    return {name: sha(subprocess.run(['git', 'show', revision + ':' + name], cwd=root,
+                 check=True, capture_output=True).stdout) for name in INPUTS}
+
+
+def current_recipe(root, revision):
+    committed = snapshot_inputs(root, revision)
+    if committed != {name: sha((root / name).read_bytes()) for name in INPUTS}:
+        raise ValueError('Current iOS producer inputs differ from declared builder commit')
+    return committed
+
+
+def stable_artifact_lock():
+    return {name: (item['id'], item['sha256'], item['size'])
+            for name, item in REVIEWED_STABLE['assets'].items()}
+
+
+def stable_plan(gh, root, builder_revision, targets):
+    if targets != REVIEWED_STABLE['rebuildTargets']:
+        raise ValueError('Reviewed stable resume must rebuild exactly ios-arm64,ios-simulator-arm64')
+    run = gh.request(gh.base + f'/actions/runs/{STABLE_RUN_ID}')
+    producer = REVIEWED_STABLE['producerRevision']
+    if (run['head_sha'] != producer or run['status'] != 'completed'
+            or run['run_attempt'] != REVIEWED_STABLE['runAttempt'] or run.get('event') != 'schedule'):
+        raise ValueError('Reviewed stable source run identity differs')
+    jobs = pages(gh, gh.base + f'/actions/runs/{STABLE_RUN_ID}/jobs', 'jobs')
+    reused = set(TARGETS) - set(targets)
+    for target in TARGETS:
+        matched = [j for j in jobs if j['name'].startswith('build (' + target + ',')]
+        expected = 'failure' if target in targets else 'success'
+        if len(matched) != 1 or matched[0]['conclusion'] != expected:
+            raise ValueError('Reviewed stable target outcome differs: ' + target)
+    historical = snapshot_inputs(root, producer)
+    if historical != REVIEWED_STABLE['producerInputHashes']:
+        raise ValueError('Historical producer Git inputs differ from reviewed hashes')
+    rebuilt = current_recipe(root, builder_revision)
+    if rebuilt['tool/sdk_smoke.py'] != historical['tool/sdk_smoke.py']:
+        raise ValueError('Reused native probes require the original SDK consumer source')
+    lock = stable_artifact_lock()
+    assets = {name: check_metadata(gh.request(gh.base + f'/actions/artifacts/{item[0]}'),
+              name, lock, STABLE_RUN_ID, producer) for name, item in lock.items()}
+    with zipfile.ZipFile(io.BytesIO(archive_bytes(gh, assets['stable-pins']))) as bundle:
+        if bundle.namelist() != ['stable-pins.json']:
+            raise ValueError('Ambiguous frozen stable source pins')
+        pins = json.loads(bundle.read('stable-pins.json'))
+    if pins != REVIEWED_STABLE['pins']:
+        raise ValueError('Frozen stable pins differ from reviewed source manifest')
+    if pins['targets'] != json.loads((root / 'tool/v8/pins.json').read_text())['targets']:
+        raise ValueError('Current target contracts differ from frozen stable pins')
+    result = {'schemaVersion': 1, 'reuseRunId': STABLE_RUN_ID, 'producerRevision': producer,
+              'packagingRevision': builder_revision, 'producerInputHashes': historical,
+              'rebuiltProducerInputHashes': rebuilt, 'rebuildTargets': targets,
+              'pins': pins, 'assets': assets, 'targets': {}}
+    for target in TARGETS:
+        if target in reused:
+            asset = assets['v8-' + target]
+            origin = {'producerRevision': producer, 'reuseProvenance': {
+                'runId': STABLE_RUN_ID, 'artifactId': asset['id'], 'artifactSha256': asset['sha256'],
+                'producerInputHashes': historical}}
+        else:
+            origin = {'producerRevision': builder_revision, 'producerInputHashes': rebuilt}
+        result['targets'][target] = origin
+    return result
+
+
+def validate_stable_plan(value, pins, builder_revision, root=None):
+    root = root or Path(__file__).resolve().parents[1]
+    producer = REVIEWED_STABLE['producerRevision']
+    historical = snapshot_inputs(root, producer)
+    rebuilt = current_recipe(root, builder_revision)
+    if (value.get('schemaVersion') != 1 or value.get('reuseRunId') != STABLE_RUN_ID
+            or value.get('producerRevision') != producer or value.get('packagingRevision') != builder_revision
+            or value.get('pins') != pins or pins != REVIEWED_STABLE['pins']
+            or value.get('assets') != REVIEWED_STABLE['assets']
+            or value.get('rebuildTargets') != REVIEWED_STABLE['rebuildTargets']
+            or value.get('producerInputHashes') != historical or historical != REVIEWED_STABLE['producerInputHashes']
+            or value.get('rebuiltProducerInputHashes') != rebuilt
+            or rebuilt['tool/sdk_smoke.py'] != historical['tool/sdk_smoke.py']
+            or set(value.get('targets', {})) != set(TARGETS)
+            or value.get('publishOnlySourceRunId') is not None):
+        raise ValueError('Reviewed stable reuse plan/source recipes differ')
+    for target, origin in value['targets'].items():
+        expected = {'producerRevision': builder_revision, 'producerInputHashes': rebuilt}
+        if target not in REVIEWED_STABLE['rebuildTargets']:
+            asset = REVIEWED_STABLE['assets']['v8-' + target]
+            expected = {'producerRevision': producer, 'reuseProvenance': {
+                'runId': STABLE_RUN_ID, 'artifactId': asset['id'], 'artifactSha256': asset['sha256'],
+                'producerInputHashes': historical}}
+        if origin != expected:
+            raise ValueError('Per-target immutable stable producer identity differs')
+
+
+def stable_download(gh, value, output, probe_only=False, only_target=None):
+    validate_stable_plan(value, value['pins'], value['packagingRevision'])
+    reused = [t for t in TARGETS if t not in REVIEWED_STABLE['rebuildTargets']]
+    names = ['smoke-probe-linux-arm64'] if probe_only else ['v8-' + t for t in reused]
+    if only_target is not None:
+        if probe_only or only_target not in reused:
+            raise ValueError('Target is not one of the eight reviewed reusable SDKs')
+        names = ['v8-' + only_target]
+    lock = stable_artifact_lock()
+    for name in names:
+        item = check_metadata(gh.request(gh.base + f"/actions/artifacts/{lock[name][0]}"), name,
+                              lock, STABLE_RUN_ID, REVIEWED_STABLE['producerRevision'])
+        if item != value['assets'][name]:
+            raise ValueError('Reviewed stable artifact differs from plan')
+        destination = output if probe_only else output / name
+        destination.mkdir(parents=True, exist_ok=False)
+        extract(archive_bytes(gh, item), destination)
+        if not probe_only:
+            target = name.removeprefix('v8-')
+            manifest = json.loads((destination / 'manifest.json').read_text())
+            if (manifest.get('v8') != value['pins']['v8'] or manifest.get('depotTools') != value['pins']['depotTools']
+                    or set(manifest.get('targets', {})) != {target}
+                    or manifest['targets'][target].get('targetConfig') != value['pins']['targets'][target]):
+                raise ValueError('Reused stable SDK source/target manifest differs')
+
+
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('action',choices=['plan','download','probe','publish-plan','publish-download'])
     p.add_argument('--repository',required=True);p.add_argument('--run-id',type=int,required=True)
     p.add_argument('--plan',type=Path,default=Path('reuse-plan.json'));p.add_argument('--output',type=Path)
-    p.add_argument('--builder-revision');p.add_argument('--github-output',type=Path);p.add_argument('--only-target',choices=TARGETS);a=p.parse_args()
-    if a.run_id!=(PUBLISH_RUN if a.action.startswith('publish-') else RUN_ID):raise ValueError('Only the reviewed immutable resume run is supported')
+    p.add_argument('--builder-revision');p.add_argument('--github-output',type=Path);p.add_argument('--only-target',choices=TARGETS)
+    p.add_argument('--targets',default='',help='Exact reviewed targets to rebuild, comma-separated; stable resume permits only both iOS targets')
+    a=p.parse_args()
+    if a.run_id not in ((PUBLISH_RUN,) if a.action.startswith('publish-') else (RUN_ID,STABLE_RUN_ID)):
+        raise ValueError('Only reviewed immutable resume runs are supported')
+    if a.targets and (a.run_id != STABLE_RUN_ID or a.action != 'plan'):
+        raise ValueError('--targets is valid only when planning the reviewed stable iOS resume')
     gh=GitHub(a.repository,os.environ['GH_TOKEN'])
     if a.action in ('plan','publish-plan'):
-        value=(publish_plan if a.action=='publish-plan' else plan)(gh,Path('.'),a.builder_revision);a.plan.write_text(json.dumps(value,indent=2)+'\n')
+        value = stable_plan(gh, Path('.'), a.builder_revision, a.targets.split(',')) if a.run_id == STABLE_RUN_ID else (publish_plan if a.action=='publish-plan' else plan)(gh,Path('.'),a.builder_revision)
+        a.plan.write_text(json.dumps(value,indent=2)+'\n')
         Path('stable-pins.json').write_text(json.dumps(value['pins'],indent=2)+'\n')
         if a.github_output:
             with a.github_output.open('a') as stream:
-                for key,val in {'should_build':'true','version':value['pins']['v8']['version'],'revision':value['pins']['v8']['revision'],'tag':'v8-'+value['pins']['v8']['version']}.items():stream.write(key+'='+val+'\n')
+                for key,val in {'should_build':'true','version':value['pins']['v8']['version'],'revision':value['pins']['v8']['revision'],'tag':'v8-'+value['pins']['v8']['version'], 'windows_arm_reused':str('reuseProvenance' in value['targets']['windows-arm64']).lower()}.items():stream.write(key+'='+val+'\n')
     elif a.action=='publish-download':download_publish(gh,json.loads(a.plan.read_text()),a.output)
-    else:download(gh,json.loads(a.plan.read_text()),a.output,a.action=='probe',a.only_target)
+    else:
+        value=json.loads(a.plan.read_text())
+        (stable_download if a.run_id==STABLE_RUN_ID else download)(gh,value,a.output,a.action=='probe',a.only_target)

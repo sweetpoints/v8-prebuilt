@@ -113,8 +113,14 @@ class ResumeTests(unittest.TestCase):
         script=textwrap.dedent(body.split("python - <<'PYTHON'\n",1)[1].split('          PYTHON',1)[0])
         for reuse,expected in [('',10),(str(resume.RUN_ID),1)]:
             output=self.root/('output-'+str(expected))
-            with patch.dict(os.environ,{'REUSE_RUN_ID':reuse,'GITHUB_OUTPUT':str(output)}):
-                exec(compile(script,'workflow-matrix','exec'),{})
+            (self.root/'reuse-plan.json').write_text(json.dumps({'targets': {target: ({'producerRevision':'b'*40} if target=='windows-arm64' else {'reuseProvenance':{}}) for target in resume.TARGETS}}))
+            previous=Path.cwd()
+            try:
+                os.chdir(self.root)
+                with patch.dict(os.environ,{'REUSE_RUN_ID':reuse,'REBUILD_TARGETS':'','GITHUB_OUTPUT':str(output)}):
+                    exec(compile(script,'workflow-matrix','exec'),{})
+            finally:
+                os.chdir(previous)
             matrix=json.loads(output.read_text().split('=',1)[1])['include']
             self.assertEqual(expected,len(matrix))
             arm=[item for item in matrix if item['target']=='windows-arm64']
@@ -139,8 +145,8 @@ class ResumeTests(unittest.TestCase):
     def test_single_new_sdk_download_has_explicit_artifact_parent(self):
         workflow=(Path(__file__).parents[1]/'.github/workflows/release.yml').read_text()
         publish=workflow.split('  publish:',1)[1]
-        self.assertIn('name: v8-windows-arm64\n          path: inputs/v8-windows-arm64',publish)
-        self.assertIn("if: needs.detect.outputs.reuse_run_id == ''\n        with:\n          pattern: v8-*",publish)
+        self.assertIn('pattern: v8-*\n          merge-multiple: false\n          path: inputs',publish)
+        self.assertIn('name: reused-sdks\n          path: inputs',publish)
     def publish_plan(self):
         with patch.object(resume,'LOCK',self.lock),patch.object(resume,'producer_inputs',return_value=self.hashes):
             return resume.publish_plan(self.api,self.root,'b'*40)

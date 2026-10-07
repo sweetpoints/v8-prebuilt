@@ -10,7 +10,12 @@ on:
         required: false
         default: ""
       reuse_run_id:
-        description: Reviewed immutable run to resume (37449592798)
+        description: Reviewed immutable source run (37449592798 or 37511114581)
+        type: string
+        required: false
+        default: ""
+      targets:
+        description: For 37511114581, exactly ios-arm64,ios-simulator-arm64
         type: string
         required: false
         default: ""
@@ -31,6 +36,7 @@ jobs:
       tag: ${{ steps.resume.outputs.tag || steps.stable.outputs.tag }}
       matrix: ${{ steps.matrix.outputs.value }}
       reuse_run_id: ${{ inputs.reuse_run_id || '' }}
+      windows_arm_reused: ${{ steps.resume.outputs.windows_arm_reused || 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
         with:
@@ -50,7 +56,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
-        run: python tool/release_resume.py plan --repository "$GITHUB_REPOSITORY" --run-id "$REUSE_RUN_ID" --builder-revision "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
+          REBUILD_TARGETS: ${{ inputs.targets || '' }}
+        run: python tool/release_resume.py plan --repository "$GITHUB_REPOSITORY" --run-id "$REUSE_RUN_ID" --targets "$REBUILD_TARGETS" --builder-revision "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
       - name: Freeze this build's source pins
         if: steps.stable.outputs.should_build == 'true'
         run: python tool/release_pins.py --detection detection.json --output stable-pins.json
@@ -65,12 +72,18 @@ jobs:
         id: matrix
         env:
           REUSE_RUN_ID: ${{ inputs.reuse_run_id || '' }}
+          REBUILD_TARGETS: ${{ inputs.targets || '' }}
         run: |
           python - <<'PYTHON'
           import json, os
           entries = [{'target': 'android-arm64', 'runner': 'ubuntu-26.04', 'jobs': 4, 'python_arch': 'x64'}, {'target': 'android-x64', 'runner': 'ubuntu-26.04', 'jobs': 4, 'python_arch': 'x64'}, {'target': 'ios-arm64', 'runner': 'macos-26', 'jobs': 2, 'python_arch': 'arm64'}, {'target': 'ios-simulator-arm64', 'runner': 'macos-26', 'jobs': 2, 'python_arch': 'arm64'}, {'target': 'macos-arm64', 'runner': 'macos-26', 'jobs': 2, 'python_arch': 'arm64'}, {'target': 'macos-x64', 'runner': 'macos-26-intel', 'jobs': 4, 'python_arch': 'x64'}, {'target': 'linux-x64', 'runner': 'ubuntu-26.04', 'jobs': 4, 'python_arch': 'x64'}, {'target': 'linux-arm64', 'runner': 'ubuntu-26.04', 'jobs': 4, 'python_arch': 'x64'}, {'target': 'windows-x64', 'runner': 'windows-2025', 'jobs': 4, 'python_arch': 'x64'}, {'target': 'windows-arm64', 'runner': 'windows-2025', 'jobs': 4, 'python_arch': 'x64'}]
           if os.environ['REUSE_RUN_ID']:
-              entries = [entry for entry in entries if entry['target'] == 'windows-arm64']
+              with open('reuse-plan.json') as stream:
+                  plan = json.load(stream)
+              missing = {target for target, origin in plan['targets'].items() if 'reuseProvenance' not in origin}
+              entries = [entry for entry in entries if entry['target'] in missing]
+          elif os.environ.get('REBUILD_TARGETS'):
+              raise ValueError('Target selection requires a reviewed immutable resume run')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
               stream.write('value=' + json.dumps({'include': entries}, separators=(',', ':')) + '\n')
           PYTHON
@@ -87,10 +100,12 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: reuse-plan
-      - name: Download only the nine verified immutable SDKs
+      - name: Download only verified immutable reused SDKs
         env:
           GH_TOKEN: ${{ github.token }}
           REUSE_RUN_ID: ${{ needs.detect.outputs.reuse_run_id }}
@@ -269,6 +284,8 @@ jobs:
     runs-on: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (Node 24)
         if: needs.detect.outputs.reuse_run_id == ''
         with:
@@ -309,19 +326,36 @@ jobs:
             artifacts/${{ needs.detect.outputs.revision }}/linux-arm64/validation/sdk-probe.json
           if-no-files-found: error
   windows-arm-runtime:
-    needs: [detect, build]
-    if: needs.detect.outputs.should_build == 'true'
+    needs: [detect, build, reuse]
+    if: always() && needs.detect.outputs.should_build == 'true' && needs.build.result == 'success' && (needs.reuse.result == 'success' || needs.reuse.result == 'skipped')
     runs-on: windows-11-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
           architecture: arm64
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.detect.outputs.windows_arm_reused != 'true'
         with:
           name: v8-windows-arm64
           path: artifacts/${{ needs.detect.outputs.revision }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        if: needs.detect.outputs.windows_arm_reused == 'true'
+        with:
+          name: reuse-plan
+      - name: Prepare reviewed immutable Windows ARM SDK and its compiled probe
+        if: needs.detect.outputs.windows_arm_reused == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN_ID: ${{ needs.detect.outputs.reuse_run_id }}
+        run: |
+          python tool/release_resume.py download --repository "$GITHUB_REPOSITORY" --run-id "$REUSE_RUN_ID" --only-target windows-arm64 --output reused-inputs
+          mkdir -p 'artifacts/${{ needs.detect.outputs.revision }}'
+          mv reused-inputs/v8-windows-arm64/windows-arm64 'artifacts/${{ needs.detect.outputs.revision }}/'
       - name: Execute the already cross-compiled official SDK consumer
         run: python tool/sdk_smoke.py --sdk-root 'artifacts/${{ needs.detect.outputs.revision }}/windows-arm64' --expected-version '${{ needs.detect.outputs.version }}' --execute-only --probe-path 'artifacts/${{ needs.detect.outputs.revision }}/windows-arm64/validation/sdk-probe.exe' --output 'artifacts/${{ needs.detect.outputs.revision }}/windows-arm64/sdk-smoke.json'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -345,16 +379,10 @@ jobs:
         with:
           fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (Node 24)
-        if: needs.detect.outputs.reuse_run_id == ''
         with:
           pattern: v8-*
           merge-multiple: false
           path: inputs
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (Node 24)
-        if: needs.detect.outputs.reuse_run_id != ''
-        with:
-          name: v8-windows-arm64
-          path: inputs/v8-windows-arm64
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (Node 24)
         with:
           name: stable-pins

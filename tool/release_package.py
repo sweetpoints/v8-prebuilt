@@ -332,6 +332,8 @@ def package(inputs, pins_path, output, builder_revision, reuse_plan=None):
         root, manifest, entry, expected_files, proof_reports = found[target]
         entry = dict(entry)
         entry['producerRevision'] = builder_revision if reuse_plan is None else reuse_plan['targets'][target]['producerRevision']
+        if reuse_plan is not None and 'producerInputHashes' in reuse_plan['targets'][target]:
+            entry['producerInputHashes'] = reuse_plan['targets'][target]['producerInputHashes']
         if reuse_plan is not None and 'reuseProvenance' in reuse_plan['targets'][target]:
             entry['reuseProvenance'] = reuse_plan['targets'][target]['reuseProvenance']
         if reuse_plan is not None and reuse_plan.get('publishOnlySourceRunId') and target in ('linux-arm64', 'windows-arm64'):

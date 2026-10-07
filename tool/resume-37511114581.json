@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 1,
+  "runId": 37511114581,
+  "producerRevision": "32c52a8fafcee88e8ad989810cdeb24310597c14",
+  "runAttempt": 1,
+  "rebuildTargets": [
+    "ios-arm64",
+    "ios-simulator-arm64"
+  ],
+  "pins": {
+    "schemaVersion": 1,
+    "v8": {
+      "repository": "https://chromium.googlesource.com/v8/v8.git",
+      "revision": "60868fa2040a823150a00ce60a75fc6e0d5ef2f7",
+      "version": "15.5.35.21"
+    },
+    "depotTools": {
+      "repository": "https://chromium.googlesource.com/chromium/tools/depot_tools.git",
+      "revision": "8a5434051036b32412a2ecb10c213a72e3f3ccb9"
+    },
+    "targets": {
+      "macos-arm64": {
+        "cpu": "arm64",
+        "minMacOS": "13.0"
+      },
+      "android-arm64": {
+        "cpu": "arm64",
+        "abi": "arm64-v8a",
+        "minApi": 26,
+        "elfMachine": 183
+      },
+      "android-x64": {
+        "cpu": "x64",
+        "abi": "x86_64",
+        "minApi": 26,
+        "elfMachine": 62
+      },
+      "macos-x64": {
+        "cpu": "x64",
+        "minMacOS": "13.0"
+      },
+      "linux-x64": {
+        "cpu": "x64",
+        "minGlibc": "2.31"
+      },
+      "linux-arm64": {
+        "cpu": "arm64",
+        "minGlibc": "2.31"
+      },
+      "windows-x64": {
+        "cpu": "x64"
+      },
+      "windows-arm64": {
+        "cpu": "arm64"
+      },
+      "ios-arm64": {
+        "cpu": "arm64",
+        "minIOS": "15.0",
+        "environment": "device"
+      },
+      "ios-simulator-arm64": {
+        "cpu": "arm64",
+        "minIOS": "15.0",
+        "environment": "simulator"
+      }
+    }
+  },
+  "assets": {
+    "v8-windows-arm64": {
+      "id": 11443894735,
+      "name": "v8-windows-arm64",
+      "sha256": "8e01d8feb12f014dd34b2aa8e64cf46eabe53250e964b1c6a0fce3bb68e6bcae",
+      "size": 64945674
+    },
+    "smoke-probe-linux-arm64": {
+      "id": 11442955023,
+      "name": "smoke-probe-linux-arm64",
+      "sha256": "e1c0dcbe16184bff1d6967bcbdf3ca4294a087627fcb76e191f3bb472f515c7b",
+      "size": 23275689
+    },
+    "v8-linux-arm64": {
+      "id": 11442775124,
+      "name": "v8-linux-arm64",
+      "sha256": "3a7fbc21d765f1dc3b167d1e5d1317945087bed098910df3b7efe1e407de8369",
+      "size": 38325501
+    },
+    "v8-android-x64": {
+      "id": 11442517912,
+      "name": "v8-android-x64",
+      "sha256": "4721b189754f16e0de741172eabf722150735ffb127effceb4ce5746605858ee",
+      "size": 64826886
+    },
+    "v8-android-arm64": {
+      "id": 11441889138,
+      "name": "v8-android-arm64",
+      "sha256": "4b615a68f1312d1477d37cefbf524e5317230a8422385898255879d3218dccb7",
+      "size": 64401331
+    },
+    "v8-macos-x64": {
+      "id": 11441843994,
+      "name": "v8-macos-x64",
+      "sha256": "7358ef7312b2a2740f47c2ec122fd1f77d6bb1d493cd42155df050c585b60895",
+      "size": 58703295
+    },
+    "v8-macos-arm64": {
+      "id": 11440207512,
+      "name": "v8-macos-arm64",
+      "sha256": "33710ead469de052de684cc1888401aac17160766c108c8b34dc5a9042728704",
+      "size": 58187015
+    },
+    "v8-linux-x64": {
+      "id": 11439486348,
+      "name": "v8-linux-x64",
+      "sha256": "7a409672dc50aff031fa67999b190c69d43870ec657226e4b3aaf03c0a22eca5",
+      "size": 61670310
+    },
+    "v8-windows-x64": {
+      "id": 11437519084,
+      "name": "v8-windows-x64",
+      "sha256": "d15c174eede037c6302efe2b93bc68387431e37280f96980af03b76e30c99a3f",
+      "size": 66747798
+    },
+    "stable-pins": {
+      "id": 11435682385,
+      "name": "stable-pins",
+      "sha256": "4c748df73e62ab5b4d39305591eb95d168f26228eda25f68cfe74d9064b661e2",
+      "size": 543
+    }
+  },
+  "producerInputHashes": {
+    "tool/v8/build.py": "578b4cbc3287f0fa16d394767cf58c5088f71695f1033bdc47aa1dff81d6ef84",
+    "tool/v8/desktop.py": "406afa974b863c1846624c9e7afc7b5f5ba074dcf7c039381f3bb2c817f3dbf3",
+    "tool/v8/ios.py": "889b50ed119c12a936d216b9dcd1223efb47b0a2265895cd0e516cffd710f91c",
+    "tool/sdk_smoke.py": "3af6853bc3a909d4fd311818e2c2ea3a75ca3baa0b4513c96a5ec9c71f43ced2",
+    "tool/v8/pins.json": "c33f8cc71caa6ca77576bb648a0f55471755e39abe6f69204edbb0009ae5b11b"
+  }
+}
