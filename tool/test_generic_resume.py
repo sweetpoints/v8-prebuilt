@@ -72,7 +72,8 @@ class FakeGitHub:
         self.add_artifact(identifier, producer, 'stable-pins', archive('stable-pins.json', pins))
         for target in targets:
             self.add_artifact(identifier, producer, 'v8-' + target,
-                              archive('manifest.json', {'fixtureTarget': target}))
+                              archive('manifest.json', {'v8': pins['v8'], 'depotTools': pins['depotTools'],
+                                  'targets': {target: {'targetConfig': pins['targets'][target]}}}))
 
     def add_artifact(self, run_id, producer, name, data):
         identifier = max(self.artifacts, default=8000) + 1
@@ -188,9 +189,9 @@ class GenericResumeTests(unittest.TestCase):
                 self.plan()
         self.api.runs[self.FIRST] = original
 
-    def test_expired_or_invalid_digest_artifact_rejected(self):
+    def test_invalid_digest_or_size_artifact_rejected(self):
         item = self.api.named(self.FIRST, 'v8-linux-x64')
-        for field, value in [('expired', True), ('digest', 'sha256:invalid'),
+        for field, value in [('digest', 'sha256:invalid'),
                              ('size_in_bytes', -1)]:
             original = item[field]
             with self.subTest(field=field):
@@ -198,6 +199,13 @@ class GenericResumeTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.plan()
             item[field] = original
+
+    def test_manual_expired_single_sdk_keeps_remaining_nine(self):
+        self.api.named(self.FIRST, 'v8-linux-x64')['expired'] = True
+        value = self.plan()
+        self.assertEqual(['linux-x64'], value['rebuildTargets'])
+        self.assertEqual(9, len(value['sdkAssets']))
+        self.assertNotIn('linux-x64', value['sdkAssets'])
 
     def test_artifact_origin_cannot_claim_another_run_or_commit(self):
         item = self.api.named(self.FIRST, 'v8-linux-x64')
@@ -360,7 +368,8 @@ class GenericResumeTests(unittest.TestCase):
         self.api.named(self.FIRST, 'v8-linux-x64')['expired'] = True
         value = resume.auto_plan(self.api, self.root, self.builder,
                                  self.pins['v8']['version'], self.pins['v8']['revision'])
-        self.assertEqual(self.SECOND, value['sourceRunId'])
+        self.assertEqual(self.FIRST, value['sourceRunId'])
+        self.assertEqual(['linux-x64'], value['rebuildTargets'])
 
     def test_runtime_archive_download_verifies_bytes_and_metadata(self):
         name = 'windows-arm-runtime'
@@ -373,6 +382,62 @@ class GenericResumeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resume.download_generic(self.api, value, self.root / 'runtime',
                                     runtime_name=name, root=self.root)
+
+    def test_cli_auto_completed_release_skips_github_and_plan_creation(self):
+        detection = self.root / 'detection.json'
+        output = self.root / 'github-output'
+        plan = self.root / 'no-plan.json'
+        detection.write_text(json.dumps({'should_build': False}))
+        argv = ['release_resume.py', 'auto', '--repository', 'sweetpoints/v8-prebuilt',
+                '--detection', str(detection), '--current-run-id', str(self.SECOND),
+                '--builder-revision', self.builder, '--github-output', str(output),
+                '--plan', str(plan)]
+        original = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with patch('sys.argv', argv), patch.object(resume, 'GitHub') as client, \
+                    patch.object(resume, 'auto_plan') as auto, patch.dict(os.environ, {}, clear=True):
+                resume.main()
+                client.assert_not_called()
+                client.return_value.request.assert_not_called()
+                auto.assert_not_called()
+            self.assertEqual('should_build=false\n', output.read_text())
+            self.assertFalse(plan.exists())
+            self.assertFalse((self.root / 'stable-pins.json').exists())
+        finally:
+            os.chdir(original)
+
+    def test_expired_single_sdk_retains_other_nine_successful_artifacts(self):
+        self.api.named(self.FIRST, 'v8-linux-x64')['expired'] = True
+        value = resume.auto_plan(self.api, self.root, self.builder,
+                                 self.pins['v8']['version'], self.pins['v8']['revision'])
+        self.assertEqual(self.FIRST, value['sourceRunId'])
+        self.assertEqual(['linux-x64'], value['rebuildTargets'])
+        self.assertEqual(9, len(value['sdkAssets']))
+        for target in value['sdkAssets']:
+            self.assertEqual(self.producer, value['targets'][target]['producerRevision'])
+
+    def test_auto_metadata_plan_does_not_download_sdks_and_download_tamper_fails_closed(self):
+        item = self.api.named(self.FIRST, 'v8-linux-x64')
+        self.api.payloads[item['id']] += b'actual downloaded bytes differ'
+        value = resume.auto_plan(self.api, self.root, self.builder,
+                                 self.pins['v8']['version'], self.pins['v8']['revision'])
+        self.assertEqual([], value['rebuildTargets'])
+        sdk_zip_urls = {self.api.base + '/actions/artifacts/' + str(record['id']) + '/zip'
+                        for record in value['sdkAssets'].values()}
+        self.assertTrue(sdk_zip_urls.isdisjoint(self.api.requests))
+        with self.assertRaisesRegex(ValueError, 'digest|SHA|size|integrity'):
+            resume.download_generic(self.api, value, self.root / 'bad-sdk',
+                                    only_target='linux-x64', root=self.root)
+        self.assertEqual([], value['rebuildTargets'])
+
+    def test_auto_pins_zip_digest_tamper_cannot_fallback_to_another_build(self):
+        self.api.add_run(self.SECOND, self.second_producer, ['ios-arm64'], self.pins)
+        item = self.api.named(self.FIRST, 'stable-pins')
+        self.api.payloads[item['id']] += b'actual metadata bytes differ'
+        with self.assertRaisesRegex(ValueError, 'digest|SHA|size|integrity'):
+            resume.auto_plan(self.api, self.root, self.builder,
+                             self.pins['v8']['version'], self.pins['v8']['revision'])
 
     def mixed_plan(self):
         ancestor = resume.generic_plan(self.api, self.root, self.second_producer, self.FIRST)

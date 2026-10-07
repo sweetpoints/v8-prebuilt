@@ -20,6 +20,10 @@ WORKFLOW = '.github/workflows/release.yml'
 RUNTIME = {'linux-arm-runtime': 'linux-arm64', 'windows-arm-runtime': 'windows-arm64'}
 MAX_DEPTH = 32
 
+class ArtifactIntegrityError(ValueError):
+    pass
+
+
 
 def sha(data): return hashlib.sha256(data).hexdigest()
 def snapshot_inputs(root, revision): return git_inputs.snapshot_inputs(root, revision, INPUTS)
@@ -74,11 +78,12 @@ def trusted_run(gh, root, run_id, builder_revision, repository):
 def artifact_record(item, run):
     checksum = item.get('digest', '')
     origin = item.get('workflow_run', {})
+    if item.get('expired') is True: raise ValueError('Source artifact expired and unavailable')
     if (not re.fullmatch('sha256:[0-9a-f]{64}', checksum) or type(item.get('id')) is not int
             or type(item.get('size_in_bytes')) is not int or item['size_in_bytes'] <= 0
             or item.get('expired') is not False or origin.get('id') != run['id']
             or origin.get('head_sha') != run['head_sha']):
-        raise ValueError('Immutable artifact identity/digest/origin unavailable')
+        raise ArtifactIntegrityError('Immutable artifact identity/digest/origin unavailable')
     return {'id': item['id'], 'name': item['name'], 'sha256': checksum[7:],
             'size': item['size_in_bytes'], 'runId': run['id'],
             'producerRevision': run['head_sha'], 'runAttempt': run['run_attempt']}
@@ -88,7 +93,7 @@ def archive_bytes(gh, item):
     data = gh.request(gh.base + f"/actions/artifacts/{item['id']}/zip",
                       content_type='application/octet-stream', accept='application/vnd.github+json')
     if len(data) != item['size'] or sha(data) != item['sha256']:
-        raise ValueError('Artifact ZIP digest/size differs')
+        raise ArtifactIntegrityError('Artifact ZIP digest/size differs')
     return data
 
 
@@ -190,10 +195,12 @@ class Graph:
             for target in TARGETS:
                 name = 'v8-' + target
                 if name in index:
+                    if index[name].get('expired') is True: continue
                     if not successful(jobs, target, target=True): raise ValueError('SDK artifact from unsuccessful build')
                     node['sdks'][target] = artifact_record(index[name], run)
             for name, target in RUNTIME.items():
                 if name in index:
+                    if index[name].get('expired') is True: continue
                     if not successful(jobs, name): raise ValueError('Runtime artifact from unsuccessful execution')
                     record = artifact_record(index[name], run)
                     sdk = node['sdks'].get(target)
@@ -204,7 +211,7 @@ class Graph:
                 sdk = node['sdks'].get(RUNTIME[name]); proof = node['runtimes'][name]
                 if not sdk or (proof['sdkArtifactId'], proof['sdkArtifactSha256']) != (sdk['id'], sdk['sha256']):
                     del node['runtimes'][name]
-            if 'smoke-probe-linux-arm64' in index:
+            if 'smoke-probe-linux-arm64' in index and index['smoke-probe-linux-arm64'].get('expired') is not True:
                 if not successful(jobs, 'linux-arm64', target=True): raise ValueError('Compiled probe from unsuccessful build')
                 sdk = node['sdks'].get('linux-arm64')
                 if not sdk: raise ValueError('Compiled probe lacks SDK origin')
@@ -324,6 +331,7 @@ def auto_plan(gh, root, builder_revision, version, revision, current_run_id=None
         if run['id'] == current_run_id: continue
         if run.get('event') not in ('schedule','workflow_dispatch') or run.get('head_branch') != graph.repository['defaultBranch']: continue
         try: node=graph.resolve(run['id'])
+        except ArtifactIntegrityError: raise
         except (ValueError,KeyError,subprocess.CalledProcessError): continue
         if node['pins'] != expected_pins: continue
         candidate=(len(node['sdks']),len(node['runtimes']))
