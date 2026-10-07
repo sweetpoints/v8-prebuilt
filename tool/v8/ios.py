@@ -330,7 +330,13 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
     out.mkdir(parents=True, exist_ok=True)
     (out / 'args.gn').write_text(args)
     common.run([depot / 'gn', 'gen', out, '--root-target=//:v8_monolith', '--fail-on-unused-args'], source, env)
-    common.run([depot / 'autoninja', '-C', out, '-j', jobs, 'v8_monolith'], source, env)
+    with common.ios_metagen_flags(source, out) as metagen_inputs:
+        common.run([depot / 'autoninja', '-C', out, '-j', jobs, 'v8_monolith'], source, env)
+    if metagen_inputs:
+        build_inputs_digest = hashlib.sha256(json.dumps({
+            'args.gn': args, 'ios.py': builder_source,
+            'metagenInputs': {name: common.sha(path) for name, path in metagen_inputs.items()},
+        }, sort_keys=True).encode()).hexdigest()
     monolith = output_for(source, out, depot, env, '//:v8_monolith')
     defines = common.sdk_defines(source, out, depot, env, root_target='//:v8_monolith')
     frameworks = common.gn_property(source, out, depot, env, '//:v8_monolith', 'frameworks', root_target='//:v8_monolith')
@@ -365,6 +371,10 @@ def build(source, depot, env, target, jobs, pins, output_root=None):
             (directory / 'validation/browser-engine-kit-policy.json').write_text(json.dumps(bek_policy, indent=2) + '\n')
         (directory / 'linking.json').write_text(json.dumps(link_contract(target, pins, defines, frameworks, system_libraries, archives, bek_policy), indent=2) + '\n')
         smoke = link_smoke(directory, source, target, pins, env)
+        for relative, original in metagen_inputs.items():
+            destination = directory / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(original, destination)
         (directory / 'args.gn').write_text(args)
         (directory / 'defines.json').write_text(json.dumps(defines, indent=2) + '\n')
         (directory / 'dependencies.txt').write_text(common.run([depot / 'gclient', 'revinfo', '--actual'], source.parent, env, capture=True))

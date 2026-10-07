@@ -25,6 +25,59 @@ TARGETS = ('macos-arm64', 'macos-x64', 'android-arm64', 'android-x64',
            'ios-arm64', 'ios-simulator-arm64')
 
 
+
+# V8 15.5.35.21's GN flag reader mistakes -isysroot's absolute SDK
+# operand for a clang-cl switch. Limit the workaround to this reviewed file;
+# restore the upstream checkout even when Ninja fails so bootstrap provenance
+# and its tracked-diff checks remain meaningful.
+IOS_METAGEN_FLAGS_SHA256 = '883f9abe171cace4fab78870badf82018956809903c17456b018c172b23131e5'
+IOS_METAGEN_DRIVER_LINE = '  cl_mode = any(f.startswith("/") for f in cflags)'
+IOS_METAGEN_DRIVER_FIX = '  # Path operands of POSIX compiler options are not clang-cl switches.\n  path_options = {"-isysroot", "--sysroot", "-I", "-isystem", "-iquote",\n                  "-include", "-imacros", "-resource-dir", "-iframework"}\n  cl_mode = any(f.startswith("/") for i, f in enumerate(cflags)\n                if i == 0 or cflags[i - 1] not in path_options)'
+
+
+@contextmanager
+def ios_metagen_flags(source, out):
+    """Yield indexed workaround evidence while using the reviewed TU flags."""
+    path = source / 'tools/metagen/compile_flags.py'
+    if not path.exists():
+        yield {}
+        return
+    original = path.read_bytes()
+    text = original.decode('utf-8')
+    if IOS_METAGEN_DRIVER_LINE not in text:
+        # A newer upstream flag reader does not contain this known defect.
+        yield {}
+        return
+    digest = hashlib.sha256(original).hexdigest()
+    if digest != IOS_METAGEN_FLAGS_SHA256 or text.count(IOS_METAGEN_DRIVER_LINE) != 1:
+        raise ValueError('Unreviewed upstream metagen driver detection; refusing to patch')
+    patched = text.replace(IOS_METAGEN_DRIVER_LINE, IOS_METAGEN_DRIVER_FIX).encode('utf-8')
+    directory = out / 'sdk-metadata/metagen-driver-fix'
+    directory.mkdir(parents=True, exist_ok=True)
+    before = directory / 'compile_flags.original.py'
+    after = directory / 'compile_flags.patched.py'
+    report = directory / 'metagen-driver-fix.json'
+    before.write_bytes(original)
+    after.write_bytes(patched)
+    report.write_text(json.dumps({
+        'schemaVersion': 1, 'reason': 'posix-sdk-path-is-not-clang-cl-option',
+        'sourcePath': 'tools/metagen/compile_flags.py',
+        'originalSha256': digest, 'patchedSha256': hashlib.sha256(patched).hexdigest(),
+        'original': 'build-inputs/compile_flags.original.py',
+        'patched': 'build-inputs/compile_flags.patched.py',
+    }, indent=2) + '\n')
+    path.write_bytes(patched)
+    try:
+        yield {'build-inputs/compile_flags.original.py': before,
+               'build-inputs/compile_flags.patched.py': after,
+               'validation/metagen-driver-fix.json': report}
+    finally:
+        changed = not path.is_file() or path.read_bytes() != patched
+        path.write_bytes(original)
+        if changed:
+            raise ValueError('Upstream metagen workaround changed during build')
+
+
 def read_pins(path=None):
     pins = json.loads((HERE / 'pins.json' if path is None else Path(path)).read_text())
     if not isinstance(pins, dict) or pins.get('schemaVersion') != 1:
