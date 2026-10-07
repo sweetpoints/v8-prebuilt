@@ -165,8 +165,8 @@ def package(inputs, pins_path, output, builder_revision, reuse_plan=None):
         raise ValueError('builder revision must be full Git SHA')
     pins = json.loads(pins_path.read_text())
     if reuse_plan is not None:
-        from release_resume import validate_plan
-        validate_plan(reuse_plan, pins, builder_revision)
+        from release_resume import validate_generic_plan
+        validate_generic_plan(reuse_plan, pins, builder_revision)
     if not re.fullmatch(r'\d+\.\d+\.\d+(?:\.\d+)?', pins['v8']['version']):
         raise ValueError('invalid V8 version')
     found = {}
@@ -326,7 +326,7 @@ def package(inputs, pins_path, output, builder_revision, reuse_plan=None):
         raise ValueError('complete ten-target build required')
     output.mkdir(parents=True, exist_ok=False)
     assets = []
-    release = dict(provenance, builderRevision=builder_revision, targets={}, licenses={})
+    release = dict(provenance, builderRevision=builder_revision, packagingRevision=builder_revision, targets={}, licenses={})
     pins_bytes = (json.dumps(pins, indent=2, sort_keys=True) + '\n').encode()
     for target in TARGETS:
         root, manifest, entry, expected_files, proof_reports = found[target]
@@ -336,10 +336,14 @@ def package(inputs, pins_path, output, builder_revision, reuse_plan=None):
             entry['producerInputHashes'] = reuse_plan['targets'][target]['producerInputHashes']
         if reuse_plan is not None and 'reuseProvenance' in reuse_plan['targets'][target]:
             entry['reuseProvenance'] = reuse_plan['targets'][target]['reuseProvenance']
-        if reuse_plan is not None and reuse_plan.get('publishOnlySourceRunId') and target in ('linux-arm64', 'windows-arm64'):
-            runtime = reuse_plan['publishAssets']['linux-arm-runtime' if target == 'linux-arm64' else 'windows-arm-runtime']
-            entry['runtimeReuseProvenance'] = {'runId': reuse_plan['publishOnlySourceRunId'],
-                'artifactId': runtime['id'], 'artifactSha256': runtime['sha256']}
+            entry['producerInputHashes'] = reuse_plan['producerRecipes'][entry['producerRevision']]
+        if reuse_plan is not None:
+            entry['producerInputHashSemantics'] = 'git-blob-sha256'
+            runtime_name = {'linux-arm64': 'linux-arm-runtime', 'windows-arm64': 'windows-arm-runtime'}.get(target)
+            if runtime_name in reuse_plan.get('runtimeAssets', {}):
+                runtime = reuse_plan['runtimeAssets'][runtime_name]
+                entry['runtimeReuseProvenance'] = {key: runtime[key] for key in
+                    ('runId', 'id', 'sha256', 'producerRevision', 'sdkArtifactId', 'sdkArtifactSha256')}
         entries = {'pins.json': pins_bytes}
         for p in sorted((root / target).rglob('*')):
             if p.is_symlink():
