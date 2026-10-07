@@ -382,25 +382,34 @@ class ReleaseTests(unittest.TestCase):
         report = json.loads(report_path.read_text()); report['compileHost'] = value['host']; report_path.write_text(json.dumps(report))
         with self.assertRaisesRegex(ValueError, 'cross-built SDK consumer proof'):
             self.package()
-    def test_packaging_records_real_reused_producer_revision(self):
-        from release_resume import RUN_ID, PRODUCER, INPUTS, LOCK
+    def test_packaging_retains_authenticated_generic_sdk_and_runtime_origins(self):
         from unittest.mock import patch
-        hashes = {name: 'a' * 64 for name in INPUTS}
-        plan = {'schemaVersion': 1, 'reuseRunId': RUN_ID, 'producerRevision': PRODUCER,
-                'packagingRevision': 'd' * 40, 'producerInputHashes': hashes, 'pins': self.pins, 'targets': {}}
-        for target in TARGETS:
-            origin = {'producerRevision': 'd' * 40}
+        hashes = {'recipe': 'a' * 64}
+        plan = {'schemaVersion': 2, 'sourceRunId': 101, 'pins': self.pins, 'targets': {}, 'runtimeAssets': {},
+                'producerRecipes': {'a' * 40: hashes}}
+        for index, target in enumerate(TARGETS):
+            origin = {'producerRevision': 'd' * 40, 'producerInputHashes': hashes}
             if target != 'windows-arm64':
-                item = LOCK['v8-' + target]
-                origin = {'producerRevision': PRODUCER, 'reuseProvenance': {'runId': RUN_ID,
-                          'artifactId': item[0], 'artifactSha256': item[1], 'producerInputHashes': hashes}}
+                origin = {'producerRevision': 'a' * 40, 'reuseProvenance': {'runId': 101,
+                          'artifactId': index + 1, 'artifactSha256': 'b' * 64, 'producerInputHashes': hashes}}
             plan['targets'][target] = origin
-        with patch('release_resume.producer_inputs', return_value=hashes):
+        plan['runtimeAssets']['linux-arm-runtime'] = {'runId': 102, 'id': 201, 'sha256': 'c' * 64,
+                         'producerRevision': 'e' * 40, 'sdkArtifactId': 5, 'sdkArtifactSha256': 'b' * 64}
+        # Graph authentication is exercised with real Git histories in generic
+        # resume tests; this fixture isolates packaging's provenance propagation.
+        with patch('release_resume.validate_generic_plan') as authenticate:
             release = package(self.inputs, self.pins_path, self.root / 'resumed', 'd' * 40, plan)
-        self.assertEqual('d' * 40, release['builderRevision'])
-        self.assertEqual(PRODUCER, release['targets']['linux-x64']['producerRevision'])
+            authenticate.assert_called_once_with(plan, self.pins, 'd' * 40)
+        self.assertEqual('a' * 40, release['targets']['linux-x64']['producerRevision'])
         self.assertEqual('d' * 40, release['targets']['windows-arm64']['producerRevision'])
-        self.assertEqual(RUN_ID, release['targets']['linux-arm64']['reuseProvenance']['runId'])
+        self.assertEqual(101, release['targets']['linux-arm64']['reuseProvenance']['runId'])
+        self.assertEqual(102, release['targets']['linux-arm64']['runtimeReuseProvenance']['runId'])
+        self.assertEqual('git-blob-sha256', release['targets']['windows-arm64']['producerInputHashSemantics'])
+        with patch('release_resume.validate_generic_plan', side_effect=ValueError('invalid graph')):
+            with self.assertRaisesRegex(ValueError, 'invalid graph'):
+                package(self.inputs, self.pins_path, self.root / 'must-not-publish', 'd' * 40, plan)
+        self.assertFalse((self.root / 'must-not-publish').exists())
+
     def test_native_probe_hash_mismatch_rejected(self):
         path = self.inputs / 'linux-x64/linux-x64/sdk-smoke.json'
         report = json.loads(path.read_text()); report['probeSha256'] = '0' * 64
