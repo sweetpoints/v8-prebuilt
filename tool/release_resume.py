@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resume the reviewed immutable nine-target build without recompiling it."""
+"""Authenticate trusted workflow artifact graphs and build only missing SDKs."""
 import argparse
 import hashlib
 import io
@@ -7,348 +7,379 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import stat
 import subprocess
+import stat
 import zipfile
 from release_package import TARGETS
 from release_publish import GitHub
 from release_pins import make_pins
+import git_inputs
 
-RUN_ID = 37449592798
-PRODUCER = 'fe19c5cbcc978b174b4f98959c9e95d0186dc219'
-PUBLISH_RUN = 37484248844
-ARM_PRODUCER = '9255ce1737836b044a84bd68b8d529ab9f640c86'
-PUBLISH_LOCK = {
- 'v8-windows-arm64': (11429647799,'c49146eb38dc1a4ceccedbcacd7e5271dd74fb54ee1ce4a63ab6c4e88443984c',64873474),
- 'linux-arm-runtime': (11430007112,'b835f6b6b361f500956b6cd68a54fd01bcced160e393c3684096f9a84382dcd5',23281114),
- 'windows-arm-runtime': (11429109991,'4ed2babe27604bac662cb17cc7453e0813681f93cc231e7ac165eb9d9e3cb213',16230443),
-}
 INPUTS = ('tool/v8/build.py', 'tool/v8/desktop.py', 'tool/v8/ios.py', 'tool/sdk_smoke.py', 'tool/v8/pins.json')
-LOCK = {
- 'v8-android-x64': (11413282146, '120af5b360f2d54a42c8ba7b8e48905b91e881e80c22d1766b5bcddb3df3fc90',64800113),
- 'v8-macos-arm64': (11413100558,'8756385202659aa01e7e3270daf200c5987d48a14cc2d3d19847fb8c72831d21',58138529),
- 'smoke-probe-linux-arm64': (11412995798,'cb6a4462fc74e9ca614241cd0319b4f5820ccf6b5a8a76470f5b75b0e55287bb',23279318),
- 'v8-android-arm64': (11412731477,'df4c2514d4402af6b42dd23cc87d22463b505d1a4305ea0879603c50f68106cf',64302565),
- 'v8-macos-x64': (11412544788,'11f2970546dcfd826f04ca6ef2634b2b3659b46b74863fbd0f25f3a58cafa107',58703433),
- 'v8-ios-simulator-arm64': (11412298094,'6e5cec8eaab8855068e60aaa56356412539f1df2d4032b7b243a345cf1dc8af6',26279916),
- 'v8-windows-x64': (11412251930,'19242d27ded2f1bc21e76753b8233d22709c91777e8a99e92927f21a08beea43',66735040),
- 'v8-linux-arm64': (11412181074,'50ab0d5cb2f93014964bf4d64cfccfe55bef579c9810e5b52cce884550e87a89',38265615),
- 'v8-ios-arm64': (11411322780,'63432712163cdb1c27844602f9091059d0d01cc402267730399da5b2d013b3b1',25966521),
- 'v8-linux-x64': (11410642088,'cdeb6b867e445fbdb8182f81fd366070de1f421fe6023b6f9c19384be14a922c',61687871),
- 'stable-pins': (11406980088,'cc6dd554314269c8fd327e0974511d1e815f03dc009a9383f1613624276d8635',544),
-}
+WORKFLOW = '.github/workflows/release.yml'
+RUNTIME = {'linux-arm-runtime': 'linux-arm64', 'windows-arm-runtime': 'windows-arm64'}
+MAX_DEPTH = 32
 
-REVIEWED_STABLE = json.loads(Path(__file__).with_name('resume-37511114581.json').read_text())
-STABLE_RUN_ID = REVIEWED_STABLE['runId']
 
 def sha(data): return hashlib.sha256(data).hexdigest()
-def producer_inputs(root,revision=PRODUCER):
-    result = {}
-    for name in INPUTS:
-        old = subprocess.run(['git','show',revision+':'+name],cwd=root,check=True,capture_output=True).stdout
-        current = (root/name).read_bytes()
-        if old != current: raise ValueError('Reused producer input changed: '+name)
-        result[name] = sha(current)
-    return result
+def snapshot_inputs(root, revision): return git_inputs.snapshot_inputs(root, revision, INPUTS)
+def current_recipe(root, revision): return git_inputs.current_recipe(root, revision, INPUTS)
+
 
 def pages(gh, url, key):
-    values=[]; page=1
+    result = []; page = 1
+    separator = '&' if '?' in url else '?'
     while True:
-        payload=gh.request(url+f'?per_page=100&page={page}'); part=payload[key]; values.extend(part)
-        if len(part)<100:return values
-        page+=1
+        values = gh.request(url + f'{separator}per_page=100&page={page}')[key]
+        result.extend(values)
+        if len(values) < 100: return result
+        page += 1
 
-def check_metadata(item,name,lock=None,run_id=RUN_ID,producer=PRODUCER):
-    identifier,checksum,size=(LOCK if lock is None else lock)[name]
-    origin=item.get('workflow_run',{})
-    if (item.get('id')!=identifier or item.get('name')!=name or item.get('digest')!='sha256:'+checksum
-        or item.get('size_in_bytes')!=size or item.get('expired') is not False
-        or origin.get('id')!=run_id or origin.get('head_sha')!=producer):
-        raise ValueError('Immutable reused artifact identity differs: '+name)
-    return {'id':identifier,'name':name,'sha256':checksum,'size':size}
 
-def archive_bytes(gh,item):
-    data=gh.request(gh.base+f"/actions/artifacts/{item['id']}/zip",content_type='application/octet-stream',accept='application/vnd.github+json')
-    if len(data)!=item['size'] or sha(data)!=item['sha256']:raise ValueError('Reused ZIP digest/size differs')
+def ancestor(root, older, newer):
+    if not all(re.fullmatch('[0-9a-f]{40}', value or '') for value in (older, newer)):
+        raise ValueError('Full Git revisions required')
+    return subprocess.run(['git', 'merge-base', '--is-ancestor', older, newer], cwd=root,
+                          capture_output=True).returncode == 0
+
+
+def repo_identity(gh):
+    name = gh.base.removeprefix('https://api.github.com/repos/')
+    if not re.fullmatch('[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', name):
+        raise ValueError('Same-repository GitHub API required')
+    repo = gh.request(gh.base)
+    workflow = gh.request(gh.base + '/actions/workflows/release.yml')
+    if repo.get('full_name') != name or workflow.get('path') != WORKFLOW:
+        raise ValueError('Official repository/workflow identity differs')
+    return {'fullName': name, 'defaultBranch': repo['default_branch'],
+            'workflowPath': WORKFLOW, 'workflowId': workflow.get('id')}
+
+
+def trusted_run(gh, root, run_id, builder_revision, repository):
+    if type(run_id) is not int or run_id <= 0: raise ValueError('Positive source run ID required')
+    run = gh.request(gh.base + f'/actions/runs/{run_id}')
+    if (run.get('status') != 'completed' or run.get('event') not in ('schedule', 'workflow_dispatch')
+            or bool(run.get('pull_requests')) or run.get('head_branch') != repository['defaultBranch']
+            or run.get('path', '').split('@')[0] != WORKFLOW
+            or run.get('repository', {}).get('full_name') != repository['fullName']
+            or run.get('head_repository', {}).get('full_name') != repository['fullName']
+            or (run.get('workflow_id') is not None and run['workflow_id'] != repository['workflowId'])
+            or not ancestor(root, run.get('head_sha'), builder_revision)):
+        raise ValueError('Untrusted source run: require same-repository official main workflow ancestor, never PR/fork')
+    return {'id': run_id, 'head_sha': run['head_sha'], 'event': run['event'], 'path': WORKFLOW,
+            'head_branch': run['head_branch'], 'run_attempt': run['run_attempt'],
+            'repository': repository['fullName']}
+
+
+def artifact_record(item, run):
+    checksum = item.get('digest', '')
+    origin = item.get('workflow_run', {})
+    if (not re.fullmatch('sha256:[0-9a-f]{64}', checksum) or type(item.get('id')) is not int
+            or type(item.get('size_in_bytes')) is not int or item['size_in_bytes'] <= 0
+            or item.get('expired') is not False or origin.get('id') != run['id']
+            or origin.get('head_sha') != run['head_sha']):
+        raise ValueError('Immutable artifact identity/digest/origin unavailable')
+    return {'id': item['id'], 'name': item['name'], 'sha256': checksum[7:],
+            'size': item['size_in_bytes'], 'runId': run['id'],
+            'producerRevision': run['head_sha'], 'runAttempt': run['run_attempt']}
+
+
+def archive_bytes(gh, item):
+    data = gh.request(gh.base + f"/actions/artifacts/{item['id']}/zip",
+                      content_type='application/octet-stream', accept='application/vnd.github+json')
+    if len(data) != item['size'] or sha(data) != item['sha256']:
+        raise ValueError('Artifact ZIP digest/size differs')
     return data
 
-def extract(data,destination):
+
+def extract(data, destination):
     with zipfile.ZipFile(io.BytesIO(data)) as bundle:
-        seen=set(); total=0
+        seen = set(); total = 0
         for item in bundle.infolist():
-            name=item.filename; path=PurePosixPath(name.rstrip('/'))
+            name = item.filename; path = PurePosixPath(name.rstrip('/'))
             if ('\\' in name or ':' in name or path.is_absolute() or '..' in path.parts or not path.parts
-                or path.as_posix()!=name.rstrip('/') or name in seen or stat.S_ISLNK(item.external_attr>>16)):
-                raise ValueError('Unsafe reused ZIP member')
-            seen.add(name); total+=item.file_size
-            if total>2_000_000_000:raise ValueError('Reused ZIP payload too large')
-            target=destination.joinpath(*path.parts)
-            if item.is_dir():target.mkdir(parents=True,exist_ok=True);continue
-            target.parent.mkdir(parents=True,exist_ok=True)
-            with target.open('xb') as stream:stream.write(bundle.read(item))
+                    or path.as_posix() != name.rstrip('/') or name in seen or stat.S_ISLNK(item.external_attr >> 16)):
+                raise ValueError('Unsafe artifact ZIP member')
+            seen.add(name); total += item.file_size
+            if total > 2_000_000_000: raise ValueError('Artifact ZIP payload too large')
+            target = destination.joinpath(*path.parts)
+            if item.is_dir(): target.mkdir(parents=True, exist_ok=True); continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open('xb') as stream: stream.write(bundle.read(item))
 
-def plan(gh,root,builder_revision):
-    if not re.fullmatch('[0-9a-f]{40}',builder_revision):raise ValueError('Full packaging revision required')
-    run=gh.request(gh.base+f'/actions/runs/{RUN_ID}')
-    if run['head_sha']!=PRODUCER or run['status']!='completed' or run['run_attempt']!=1:
-        raise ValueError('Reviewed reused run identity differs')
-    jobs=pages(gh,gh.base+f'/actions/runs/{RUN_ID}/jobs','jobs')
-    reused=set(TARGETS)-{'windows-arm64'}
-    for target in reused:
-        matched=[job for job in jobs if job['name'].startswith('build ('+target+',')]
-        if len(matched)!=1 or matched[0]['conclusion']!='success':raise ValueError('Reused target build did not succeed: '+target)
-    hashes=producer_inputs(root)
-    assets={}
-    for name in LOCK:
-        item=gh.request(gh.base+f'/actions/artifacts/{LOCK[name][0]}')
-        assets[name]=check_metadata(item,name)
-    with zipfile.ZipFile(io.BytesIO(archive_bytes(gh,assets['stable-pins']))) as bundle:
-        if bundle.namelist()!=['stable-pins.json']:raise ValueError('Ambiguous frozen source pins')
-        pins=json.loads(bundle.read('stable-pins.json'))
-    detection={'version':'15.4.80.25','revision':'c45871fec706a6e7b715e607065bb4578b23ce9f','tag':'v8-15.4.80.25'}
-    if pins!=make_pins(json.loads((root/'tool/v8/pins.json').read_text()),detection):raise ValueError('Frozen pins or target configurations differ')
-    result={'schemaVersion':1,'reuseRunId':RUN_ID,'producerRevision':PRODUCER,'packagingRevision':builder_revision,
-            'producerInputHashes':hashes,'pins':pins,'assets':assets,'targets':{}}
+
+def json_artifact(gh, record, filename):
+    if record['size'] > 8 * 1024 * 1024: raise ValueError('Source metadata artifact too large')
+    with zipfile.ZipFile(io.BytesIO(archive_bytes(gh, record))) as bundle:
+        if bundle.namelist() != [filename]: raise ValueError('Ambiguous source metadata artifact')
+        data = bundle.read(filename)
+        if len(data) > 8 * 1024 * 1024: raise ValueError('Source metadata payload too large')
+        return json.loads(data)
+
+
+def validate_pins(pins):
+    official = {'v8': 'https://chromium.googlesource.com/v8/v8.git',
+                'depotTools': 'https://chromium.googlesource.com/chromium/tools/depot_tools.git'}
+    if pins.get('schemaVersion') != 1 or set(pins.get('targets', {})) != set(TARGETS):
+        raise ValueError('Complete official target source pins required')
+    for key, url in official.items():
+        item = pins.get(key, {})
+        if item.get('repository') != url or not re.fullmatch('[0-9a-f]{40}', item.get('revision', '')):
+            raise ValueError('Official fixed source revision required')
+    if not re.fullmatch(r'\d+\.\d+\.\d+(?:\.\d+)?', pins['v8'].get('version', '')):
+        raise ValueError('Fixed source version required')
+
+
+def successful(jobs, name, target=False):
+    matched = [j for j in jobs if (j['name'].startswith('build (' + name + ',') if target else j['name'] == name)]
+    return any(j.get('conclusion') == 'success' for j in matched)
+
+
+class Graph:
+    def __init__(self, gh, root, builder_revision):
+        self.gh, self.root, self.builder = gh, root, builder_revision
+        self.repository = repo_identity(gh); self.nodes = {}; self.active = set()
+
+    def resolve(self, run_id):
+        if run_id in self.active or len(self.active) >= MAX_DEPTH: raise ValueError('Cyclic or excessive reuse graph')
+        if run_id in self.nodes: return self.nodes[run_id]
+        self.active.add(run_id)
+        try:
+            run = trusted_run(self.gh, self.root, run_id, self.builder, self.repository)
+            jobs = pages(self.gh, self.gh.base + f'/actions/runs/{run_id}/jobs?filter=all', 'jobs')
+            values = pages(self.gh, self.gh.base + f'/actions/runs/{run_id}/artifacts', 'artifacts')
+            index = {}
+            for item in values:
+                name = item['name']
+                if name in index: raise ValueError('Duplicate artifact name in source run')
+                index[name] = item
+            if not successful(jobs, 'detect'): raise ValueError('Frozen source detection did not succeed')
+            pin_record = artifact_record(index['stable-pins'], run)
+            pins = json_artifact(self.gh, pin_record, 'stable-pins.json'); validate_pins(pins)
+            committed_base = json.loads(subprocess.run(['git', 'show', run['head_sha'] + ':tool/v8/pins.json'],
+                                        cwd=self.root, check=True, capture_output=True).stdout)
+            expected_pins = make_pins(committed_base, {'version': pins['v8']['version'],
+                         'revision': pins['v8']['revision'], 'tag': 'v8-' + pins['v8']['version']})
+            if pins != expected_pins: raise ValueError('Frozen pins differ from source producer recipe')
+            node = {'run': run, 'pins': pins, 'sdks': {}, 'runtimes': {}, 'probes': {}, 'metadata': {'stable-pins': pin_record}}
+            if 'reuse-plan' in index:
+                plan_record = artifact_record(index['reuse-plan'], run)
+                saved = json_artifact(self.gh, plan_record, 'reuse-plan.json')
+                if saved.get('pins') != pins or saved.get('packagingRevision') != run['head_sha']:
+                    raise ValueError('Archived reuse plan frozen pins/producer differs')
+                parent_id = saved.get('sourceRunId') or saved.get('reuseRunId')
+                parents = {parent_id} if parent_id is not None else set()
+                parents.update(o['reuseProvenance']['runId'] for o in saved.get('targets', {}).values() if 'reuseProvenance' in o)
+                parent_nodes = {identifier: self.resolve(identifier) for identifier in parents}
+                for parent in parent_nodes.values():
+                    if parent['pins'] != pins: raise ValueError('Reuse graph source pins differ')
+                    node['runtimes'].update(parent['runtimes']); node['probes'].update(parent['probes'])
+                for target, origin in saved.get('targets', {}).items():
+                    if target not in TARGETS: raise ValueError('Unknown archived reuse target')
+                    if 'reuseProvenance' in origin:
+                        claim = origin['reuseProvenance']; parent = parent_nodes[claim['runId']]
+                        record = parent['sdks'].get(target)
+                        if (record is None or origin['producerRevision'] != record['producerRevision']
+                                or claim['artifactId'] != record['id'] or claim['artifactSha256'] != record['sha256']
+                                or claim.get('producerInputHashes') != snapshot_inputs(self.root, record['producerRevision'])):
+                            raise ValueError('Archived reuse origin/producer input proof differs')
+                        node['sdks'][target] = record
+                    elif origin.get('producerRevision') != run['head_sha']:
+                        raise ValueError('Archived new target producer differs')
+                node['metadata']['reuse-plan'] = plan_record
+            for target in TARGETS:
+                name = 'v8-' + target
+                if name in index:
+                    if not successful(jobs, target, target=True): raise ValueError('SDK artifact from unsuccessful build')
+                    node['sdks'][target] = artifact_record(index[name], run)
+            for name, target in RUNTIME.items():
+                if name in index:
+                    if not successful(jobs, name): raise ValueError('Runtime artifact from unsuccessful execution')
+                    record = artifact_record(index[name], run)
+                    sdk = node['sdks'].get(target)
+                    if not sdk: raise ValueError('Runtime lacks authenticated SDK origin')
+                    record = dict(record, sdkArtifactId=sdk['id'], sdkArtifactSha256=sdk['sha256'])
+                    node['runtimes'][name] = record
+            for name in list(node['runtimes']):
+                sdk = node['sdks'].get(RUNTIME[name]); proof = node['runtimes'][name]
+                if not sdk or (proof['sdkArtifactId'], proof['sdkArtifactSha256']) != (sdk['id'], sdk['sha256']):
+                    del node['runtimes'][name]
+            if 'smoke-probe-linux-arm64' in index:
+                if not successful(jobs, 'linux-arm64', target=True): raise ValueError('Compiled probe from unsuccessful build')
+                sdk = node['sdks'].get('linux-arm64')
+                if not sdk: raise ValueError('Compiled probe lacks SDK origin')
+                node['probes']['smoke-probe-linux-arm64'] = dict(artifact_record(index['smoke-probe-linux-arm64'], run),
+                                sdkArtifactId=sdk['id'], sdkArtifactSha256=sdk['sha256'])
+            for name in list(node['probes']):
+                sdk=node['sdks'].get('linux-arm64'); probe=node['probes'][name]
+                if not sdk or (probe.get('sdkArtifactId'), probe.get('sdkArtifactSha256')) != (sdk['id'],sdk['sha256']):
+                    del node['probes'][name]
+            self.nodes[run_id] = node
+            return node
+        finally: self.active.remove(run_id)
+
+
+def compose_plan(graph, node, root, builder_revision, targets=None):
+    base=json.loads((Path(root)/'tool/v8/pins.json').read_text())
+    expected=make_pins(base,{'version':node['pins']['v8']['version'],'revision':node['pins']['v8']['revision'],'tag':'v8-'+node['pins']['v8']['version']})
+    if expected != node['pins']: raise ValueError('Frozen source pins differ from current target/depot contracts')
+    missing = [t for t in TARGETS if t not in node['sdks']]
+    if targets is not None and (len(targets)!=len(set(targets)) or set(targets) != set(missing)): raise ValueError('Requested targets must equal missing targets; successful SDKs cannot rebuild')
+    recipes = {r['producerRevision']: snapshot_inputs(root, r['producerRevision']) for r in node['sdks'].values()}
+    packaging = current_recipe(root, builder_revision)
+    origins = {}
     for target in TARGETS:
-        origin={'producerRevision':builder_revision}
-        if target in reused:
-            origin={'producerRevision':PRODUCER,'reuseProvenance':{'runId':RUN_ID,'artifactId':assets['v8-'+target]['id'],
-                      'artifactSha256':assets['v8-'+target]['sha256'],'producerInputHashes':hashes}}
-        result['targets'][target]=origin
-    return result
-
-def download(gh,plan_value,output,probe_only=False,only_target=None):
-    if plan_value['reuseRunId']!=RUN_ID or plan_value['producerRevision']!=PRODUCER:raise ValueError('Reuse plan identity differs')
-    names=['smoke-probe-linux-arm64'] if probe_only else ['v8-'+target for target in TARGETS if target!='windows-arm64']
-    if only_target is not None:
-        if probe_only or only_target=='windows-arm64' or only_target not in TARGETS:raise ValueError('Target is not reusable')
-        names=['v8-'+only_target]
-    for name in names:
-        item=check_metadata(gh.request(gh.base+f'/actions/artifacts/{LOCK[name][0]}'),name)
-        if item!=plan_value['assets'][name]:raise ValueError('Reuse plan artifact changed')
-        destination=output if probe_only else output/name
-        destination.mkdir(parents=True,exist_ok=False)
-        extract(archive_bytes(gh,item),destination)
-        if not probe_only:
-            target=name.removeprefix('v8-');manifest=json.loads((destination/'manifest.json').read_text())
-            if (manifest['v8']!=plan_value['pins']['v8'] or manifest['depotTools']!=plan_value['pins']['depotTools']
-                or set(manifest['targets'])!={target}):raise ValueError('Reused SDK provenance differs')
-            entry=manifest['targets'][target];config=plan_value['pins']['targets'][target]
-            if target.startswith('ios-'):
-                if entry['minIOS']!=config['minIOS'] or entry['environment']!=config['environment']:raise ValueError('Reused iOS target config differs')
-            elif entry.get('targetConfig')!=config:raise ValueError('Reused target configuration differs')
-
-def validate_plan(value,pins,builder_revision):
-    if value.get('reuseRunId') == STABLE_RUN_ID:
-        return validate_stable_plan(value, pins, builder_revision)
-    if value.get('publishOnlySourceRunId') not in (None,PUBLISH_RUN):raise ValueError('Unreviewed publish-only run')
-    if value.get('publishOnlySourceRunId')==PUBLISH_RUN:
-        for name,(identifier,checksum,size) in PUBLISH_LOCK.items():
-            if value.get('publishAssets',{}).get(name)!={'id':identifier,'name':name,'sha256':checksum,'size':size}:
-                raise ValueError('Publish-only artifact lock differs')
-    if (value.get('schemaVersion')!=1 or value.get('reuseRunId')!=RUN_ID or value.get('producerRevision')!=PRODUCER
-        or value.get('packagingRevision')!=builder_revision or value.get('pins')!=pins
-        or set(value.get('targets',{}))!=set(TARGETS) or set(value.get('producerInputHashes',{}))!=set(INPUTS)):
-        raise ValueError('Packaging reuse provenance differs')
-    if value['producerInputHashes']!=producer_inputs(Path(__file__).resolve().parents[1]):raise ValueError('Producer inputs no longer match verified reuse plan')
-    for target,origin in value['targets'].items():
-        if target=='windows-arm64':
-            expected={'producerRevision':builder_revision}
-            if value.get('publishOnlySourceRunId')==PUBLISH_RUN:
-                asset=PUBLISH_LOCK['v8-windows-arm64']
-                expected={'producerRevision':ARM_PRODUCER,'reuseProvenance':{'runId':PUBLISH_RUN,'artifactId':asset[0],
-                          'artifactSha256':asset[1],'producerInputHashes':value['producerInputHashes']}}
-                if producer_inputs(Path(__file__).resolve().parents[1],ARM_PRODUCER)!=value['producerInputHashes']:
-                    raise ValueError('Windows producer inputs no longer match')
-            if origin!=expected:raise ValueError('New target producer provenance differs')
-        else:
-            asset=LOCK['v8-'+target]
-            expected={'producerRevision':PRODUCER,'reuseProvenance':{'runId':RUN_ID,'artifactId':asset[0],
-                      'artifactSha256':asset[1],'producerInputHashes':value['producerInputHashes']}}
-            if origin!=expected:raise ValueError('Reused target producer provenance differs')
-
-def publish_plan(gh,root,builder_revision):
-    value=plan(gh,root,builder_revision)
-    if producer_inputs(root,ARM_PRODUCER)!=value['producerInputHashes']:raise ValueError('Windows producer recipe changed')
-    run=gh.request(gh.base+f'/actions/runs/{PUBLISH_RUN}')
-    if run['head_sha']!=ARM_PRODUCER or run['status']!='completed' or run['run_attempt']!=1:
-        raise ValueError('Publish-only source run identity differs')
-    jobs=pages(gh,gh.base+f'/actions/runs/{PUBLISH_RUN}/jobs','jobs')
-    for name in ('detect','reuse','windows-arm-runtime','linux-arm-runtime'):
-        selected=[job for job in jobs if job['name']==name]
-        if len(selected)!=1 or selected[0]['conclusion']!='success':raise ValueError('Reusable runtime stage did not succeed')
-    build=[job for job in jobs if job['name'].startswith('build (windows-arm64,')]
-    if len(build)!=1 or build[0]['conclusion']!='success':raise ValueError('Reusable Windows SDK did not succeed')
-    value['publishOnlySourceRunId']=PUBLISH_RUN;value['publishAssets']={}
-    for name,item in PUBLISH_LOCK.items():
-        value['publishAssets'][name]=check_metadata(gh.request(gh.base+f'/actions/artifacts/{item[0]}'),name,PUBLISH_LOCK,PUBLISH_RUN,ARM_PRODUCER)
-    item=PUBLISH_LOCK['v8-windows-arm64']
-    value['targets']['windows-arm64']={'producerRevision':ARM_PRODUCER,'reuseProvenance':{
-        'runId':PUBLISH_RUN,'artifactId':item[0],'artifactSha256':item[1],'producerInputHashes':value['producerInputHashes']}}
-    return value
-
-def download_publish(gh,value,output):
-    validate_plan(value,value['pins'],value['packagingRevision'])
-    download(gh,value,output)
-    for name,item in PUBLISH_LOCK.items():
-        metadata=check_metadata(gh.request(gh.base+f'/actions/artifacts/{item[0]}'),name,PUBLISH_LOCK,PUBLISH_RUN,ARM_PRODUCER)
-        if metadata!=value['publishAssets'][name]:raise ValueError('Publish-only artifact differs')
-        destination=output/name;destination.mkdir()
-        extract(archive_bytes(gh,metadata),destination)
-    target='windows-arm64';manifest=json.loads((output/'v8-windows-arm64/manifest.json').read_text())
-    if (manifest['v8']!=value['pins']['v8'] or manifest['depotTools']!=value['pins']['depotTools']
-        or set(manifest['targets'])!={target} or manifest['targets'][target].get('targetConfig')!=value['pins']['targets'][target]):
-        raise ValueError('Published Windows SDK source/config differs')
-    import shutil
-    for target,runtime in [('linux-arm64','linux-arm-runtime'),('windows-arm64','windows-arm-runtime')]:
-        directory=output/('v8-'+target)/target
-        shutil.copyfile(output/runtime/'sdk-smoke.json',directory/'sdk-smoke.json')
-        (directory/'validation').mkdir(exist_ok=True)
-        for path in (output/runtime/'validation').glob('sdk-probe*'):
-            shutil.copyfile(path,directory/'validation'/path.name)
-        shutil.rmtree(output/runtime)
-
-def snapshot_inputs(root, revision):
-    """Read every producer input at its actual immutable Git commit."""
-    if not re.fullmatch('[0-9a-f]{40}', revision):
-        raise ValueError('Full producer revision required')
-    return {name: sha(subprocess.run(['git', 'show', revision + ':' + name], cwd=root,
-                 check=True, capture_output=True).stdout) for name in INPUTS}
+        if target in node['sdks']:
+            r = node['sdks'][target]
+            origins[target] = {'producerRevision': r['producerRevision'], 'reuseProvenance': {
+                'runId': r['runId'], 'artifactId': r['id'], 'artifactSha256': r['sha256'],
+                'producerInputHashes': recipes[r['producerRevision']]}}
+        else: origins[target] = {'producerRevision': builder_revision, 'producerInputHashes': packaging}
+    return {'schemaVersion': 2, 'sourceRunId': node['run']['id'], 'repository': graph.repository,
+            'packagingRevision': builder_revision, 'packagingInputHashes': packaging, 'producerRecipes': recipes,
+            'sourceRuns': {str(k): v['run'] for k, v in graph.nodes.items()}, 'pins': node['pins'],
+            'metadataAssets': {str(k): v['metadata'] for k, v in graph.nodes.items()},
+            'sdkAssets': node['sdks'], 'assets': {'v8-' + t: r for t, r in node['sdks'].items()} | node['probes'],
+            'runtimeAssets': node['runtimes'], 'runtimeRequired': [t for n,t in RUNTIME.items() if n not in node['runtimes']],
+            'rebuildTargets': missing, 'targets': origins}
 
 
-def current_recipe(root, revision):
-    committed = snapshot_inputs(root, revision)
-    if committed != {name: sha((root / name).read_bytes()) for name in INPUTS}:
-        raise ValueError('Current iOS producer inputs differ from declared builder commit')
-    return committed
+def generic_plan(gh, root, builder_revision, run_id, targets=None):
+    if run_id == 'auto':
+        base = json.loads((Path(root) / 'tool/v8/pins.json').read_text())
+        return auto_plan(gh, root, builder_revision, base['v8']['version'], base['v8']['revision'])
+    graph = Graph(gh, root, builder_revision)
+    return compose_plan(graph, graph.resolve(int(run_id)), root, builder_revision, targets)
 
 
-def stable_artifact_lock():
-    return {name: (item['id'], item['sha256'], item['size'])
-            for name, item in REVIEWED_STABLE['assets'].items()}
-
-
-def stable_plan(gh, root, builder_revision, targets):
-    if targets != REVIEWED_STABLE['rebuildTargets']:
-        raise ValueError('Reviewed stable resume must rebuild exactly ios-arm64,ios-simulator-arm64')
-    run = gh.request(gh.base + f'/actions/runs/{STABLE_RUN_ID}')
-    producer = REVIEWED_STABLE['producerRevision']
-    if (run['head_sha'] != producer or run['status'] != 'completed'
-            or run['run_attempt'] != REVIEWED_STABLE['runAttempt'] or run.get('event') != 'schedule'):
-        raise ValueError('Reviewed stable source run identity differs')
-    jobs = pages(gh, gh.base + f'/actions/runs/{STABLE_RUN_ID}/jobs', 'jobs')
-    reused = set(TARGETS) - set(targets)
-    for target in TARGETS:
-        matched = [j for j in jobs if j['name'].startswith('build (' + target + ',')]
-        expected = 'failure' if target in targets else 'success'
-        if len(matched) != 1 or matched[0]['conclusion'] != expected:
-            raise ValueError('Reviewed stable target outcome differs: ' + target)
-    historical = snapshot_inputs(root, producer)
-    if historical != REVIEWED_STABLE['producerInputHashes']:
-        raise ValueError('Historical producer Git inputs differ from reviewed hashes')
-    rebuilt = current_recipe(root, builder_revision)
-    if rebuilt['tool/sdk_smoke.py'] != historical['tool/sdk_smoke.py']:
-        raise ValueError('Reused native probes require the original SDK consumer source')
-    lock = stable_artifact_lock()
-    assets = {name: check_metadata(gh.request(gh.base + f'/actions/artifacts/{item[0]}'),
-              name, lock, STABLE_RUN_ID, producer) for name, item in lock.items()}
-    with zipfile.ZipFile(io.BytesIO(archive_bytes(gh, assets['stable-pins']))) as bundle:
-        if bundle.namelist() != ['stable-pins.json']:
-            raise ValueError('Ambiguous frozen stable source pins')
-        pins = json.loads(bundle.read('stable-pins.json'))
-    if pins != REVIEWED_STABLE['pins']:
-        raise ValueError('Frozen stable pins differ from reviewed source manifest')
-    if pins['targets'] != json.loads((root / 'tool/v8/pins.json').read_text())['targets']:
-        raise ValueError('Current target contracts differ from frozen stable pins')
-    result = {'schemaVersion': 1, 'reuseRunId': STABLE_RUN_ID, 'producerRevision': producer,
-              'packagingRevision': builder_revision, 'producerInputHashes': historical,
-              'rebuiltProducerInputHashes': rebuilt, 'rebuildTargets': targets,
-              'pins': pins, 'assets': assets, 'targets': {}}
-    for target in TARGETS:
-        if target in reused:
-            asset = assets['v8-' + target]
-            origin = {'producerRevision': producer, 'reuseProvenance': {
-                'runId': STABLE_RUN_ID, 'artifactId': asset['id'], 'artifactSha256': asset['sha256'],
-                'producerInputHashes': historical}}
-        else:
-            origin = {'producerRevision': builder_revision, 'producerInputHashes': rebuilt}
-        result['targets'][target] = origin
-    return result
-
-
-def validate_stable_plan(value, pins, builder_revision, root=None):
-    root = root or Path(__file__).resolve().parents[1]
-    producer = REVIEWED_STABLE['producerRevision']
-    historical = snapshot_inputs(root, producer)
-    rebuilt = current_recipe(root, builder_revision)
-    if (value.get('schemaVersion') != 1 or value.get('reuseRunId') != STABLE_RUN_ID
-            or value.get('producerRevision') != producer or value.get('packagingRevision') != builder_revision
-            or value.get('pins') != pins or pins != REVIEWED_STABLE['pins']
-            or value.get('assets') != REVIEWED_STABLE['assets']
-            or value.get('rebuildTargets') != REVIEWED_STABLE['rebuildTargets']
-            or value.get('producerInputHashes') != historical or historical != REVIEWED_STABLE['producerInputHashes']
-            or value.get('rebuiltProducerInputHashes') != rebuilt
-            or rebuilt['tool/sdk_smoke.py'] != historical['tool/sdk_smoke.py']
-            or set(value.get('targets', {})) != set(TARGETS)
-            or value.get('publishOnlySourceRunId') is not None):
-        raise ValueError('Reviewed stable reuse plan/source recipes differ')
+def validate_generic_plan(value, pins, builder_revision, root=None):
+    root = root or Path(__file__).resolve().parents[1]; validate_pins(pins)
+    base=json.loads((Path(root)/'tool/v8/pins.json').read_text())
+    if pins != make_pins(base,{'version':pins['v8']['version'],'revision':pins['v8']['revision'],'tag':'v8-'+pins['v8']['version']}):
+        raise ValueError('Plan target/depot contracts differ from current recipe')
+    if (value.get('schemaVersion') != 2 or value.get('pins') != pins or value.get('packagingRevision') != builder_revision
+            or value.get('packagingInputHashes') != current_recipe(root, builder_revision)
+            or set(value.get('targets', {})) != set(TARGETS)):
+        raise ValueError('Generic plan source/packaging recipe differs')
+    expected_missing = [t for t in TARGETS if t not in value.get('sdkAssets', {})]
+    if value.get('rebuildTargets') != expected_missing: raise ValueError('Missing target inventory differs')
     for target, origin in value['targets'].items():
-        expected = {'producerRevision': builder_revision, 'producerInputHashes': rebuilt}
-        if target not in REVIEWED_STABLE['rebuildTargets']:
-            asset = REVIEWED_STABLE['assets']['v8-' + target]
-            expected = {'producerRevision': producer, 'reuseProvenance': {
-                'runId': STABLE_RUN_ID, 'artifactId': asset['id'], 'artifactSha256': asset['sha256'],
-                'producerInputHashes': historical}}
-        if origin != expected:
-            raise ValueError('Per-target immutable stable producer identity differs')
+        if target in expected_missing:
+            if origin != {'producerRevision': builder_revision, 'producerInputHashes': value['packagingInputHashes']}:
+                raise ValueError('New SDK producer differs')
+        else:
+            r = value['sdkAssets'][target]; run = value['sourceRuns'].get(str(r['runId']))
+            recipe = snapshot_inputs(root, r['producerRevision'])
+            if not run or run['head_sha'] != r['producerRevision'] or not ancestor(root, r['producerRevision'], builder_revision):
+                raise ValueError('Immutable SDK source run differs')
+            expected = {'producerRevision': r['producerRevision'], 'reuseProvenance': {
+                'runId': r['runId'], 'artifactId': r['id'], 'artifactSha256': r['sha256'], 'producerInputHashes': recipe}}
+            if origin != expected or value['producerRecipes'].get(r['producerRevision']) != recipe:
+                raise ValueError('Actual SDK producer/recipe relabeled')
+    for name, proof in value.get('runtimeAssets', {}).items():
+        sdk = value['sdkAssets'].get(RUNTIME.get(name))
+        if not sdk or (proof.get('sdkArtifactId'), proof.get('sdkArtifactSha256')) != (sdk['id'], sdk['sha256']):
+            raise ValueError('Runtime/SDK origin differs')
 
 
-def stable_download(gh, value, output, probe_only=False, only_target=None):
-    validate_stable_plan(value, value['pins'], value['packagingRevision'])
-    reused = [t for t in TARGETS if t not in REVIEWED_STABLE['rebuildTargets']]
-    names = ['smoke-probe-linux-arm64'] if probe_only else ['v8-' + t for t in reused]
-    if only_target is not None:
-        if probe_only or only_target not in reused:
-            raise ValueError('Target is not one of the eight reviewed reusable SDKs')
-        names = ['v8-' + only_target]
-    lock = stable_artifact_lock()
-    for name in names:
-        item = check_metadata(gh.request(gh.base + f"/actions/artifacts/{lock[name][0]}"), name,
-                              lock, STABLE_RUN_ID, REVIEWED_STABLE['producerRevision'])
-        if item != value['assets'][name]:
-            raise ValueError('Reviewed stable artifact differs from plan')
-        destination = output if probe_only else output / name
-        destination.mkdir(parents=True, exist_ok=False)
-        extract(archive_bytes(gh, item), destination)
-        if not probe_only:
-            target = name.removeprefix('v8-')
-            manifest = json.loads((destination / 'manifest.json').read_text())
-            if (manifest.get('v8') != value['pins']['v8'] or manifest.get('depotTools') != value['pins']['depotTools']
-                    or set(manifest.get('targets', {})) != {target}
-                    or manifest['targets'][target].get('targetConfig') != value['pins']['targets'][target]):
-                raise ValueError('Reused stable SDK source/target manifest differs')
+def check_record(gh, record, value, root):
+    run = trusted_run(gh, root, record['runId'], value['packagingRevision'], value['repository'])
+    if value['sourceRuns'].get(str(record['runId'])) != run: raise ValueError('Source run changed since planning')
+    item = artifact_record(gh.request(gh.base + f"/actions/artifacts/{record['id']}"), run)
+    if item != {k:record[k] for k in item}: raise ValueError('Artifact metadata changed since planning')
+    return item
 
 
-if __name__=='__main__':
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('action',choices=['plan','download','probe','publish-plan','publish-download'])
-    p.add_argument('--repository',required=True);p.add_argument('--run-id',type=int,required=True)
-    p.add_argument('--plan',type=Path,default=Path('reuse-plan.json'));p.add_argument('--output',type=Path)
-    p.add_argument('--builder-revision');p.add_argument('--github-output',type=Path);p.add_argument('--only-target',choices=TARGETS)
-    p.add_argument('--targets',default='',help='Exact reviewed targets to rebuild, comma-separated; stable resume permits only both iOS targets')
-    a=p.parse_args()
-    if a.run_id not in ((PUBLISH_RUN,) if a.action.startswith('publish-') else (RUN_ID,STABLE_RUN_ID)):
-        raise ValueError('Only reviewed immutable resume runs are supported')
-    if a.targets and (a.run_id != STABLE_RUN_ID or a.action != 'plan'):
-        raise ValueError('--targets is valid only when planning the reviewed stable iOS resume')
-    gh=GitHub(a.repository,os.environ['GH_TOKEN'])
-    if a.action in ('plan','publish-plan'):
-        value = stable_plan(gh, Path('.'), a.builder_revision, a.targets.split(',')) if a.run_id == STABLE_RUN_ID else (publish_plan if a.action=='publish-plan' else plan)(gh,Path('.'),a.builder_revision)
-        a.plan.write_text(json.dumps(value,indent=2)+'\n')
-        Path('stable-pins.json').write_text(json.dumps(value['pins'],indent=2)+'\n')
-        if a.github_output:
-            with a.github_output.open('a') as stream:
-                for key,val in {'should_build':'true','version':value['pins']['v8']['version'],'revision':value['pins']['v8']['revision'],'tag':'v8-'+value['pins']['v8']['version'], 'windows_arm_reused':str('reuseProvenance' in value['targets']['windows-arm64']).lower()}.items():stream.write(key+'='+val+'\n')
-    elif a.action=='publish-download':download_publish(gh,json.loads(a.plan.read_text()),a.output)
+def download_generic(gh, value, output, probe_only=False, only_target=None, runtime_name=None, root=None):
+    root = root or Path(__file__).resolve().parents[1]
+    validate_generic_plan(value, value['pins'], value['packagingRevision'], root)
+    if runtime_name:
+        if runtime_name not in RUNTIME: raise ValueError('Unknown runtime artifact')
+        records = [(runtime_name, value['runtimeAssets'][runtime_name], False)]
+    elif probe_only:
+        records = [('probe', value['assets']['smoke-probe-linux-arm64'], False)]
     else:
-        value=json.loads(a.plan.read_text())
-        (stable_download if a.run_id==STABLE_RUN_ID else download)(gh,value,a.output,a.action=='probe',a.only_target)
+        targets = [only_target] if only_target else list(value['sdkAssets'])
+        if any(t not in value['sdkAssets'] for t in targets): raise ValueError('SDK is not reusable')
+        records = [('v8-'+t,value['sdkAssets'][t],True) for t in targets]
+    for name, record, sdk in records:
+        item = check_record(gh, record, value, root)
+        destination = Path(output) / name if sdk else Path(output)
+        destination.mkdir(parents=True, exist_ok=False)
+        extract(archive_bytes(gh,item), destination)
+        if sdk:
+            target = name[3:]; manifest = json.loads((destination/'manifest.json').read_text())
+            if (manifest.get('v8') != value['pins']['v8'] or manifest.get('depotTools') != value['pins']['depotTools']
+                    or set(manifest.get('targets',{})) != {target}): raise ValueError('SDK source manifest differs')
+            config = value['pins']['targets'][target]; entry=manifest['targets'][target]
+            if entry.get('targetConfig') != config and not (target.startswith('ios-') and entry.get('minIOS')==config.get('minIOS') and entry.get('environment')==config.get('environment')):
+                raise ValueError('SDK target configuration differs')
+
+
+def auto_plan(gh, root, builder_revision, version, revision, current_run_id=None):
+    graph = Graph(gh, root, builder_revision); best=None; score=(-1,-1)
+    expected_pins=make_pins(json.loads((Path(root)/'tool/v8/pins.json').read_text()),{'version':version,'revision':revision,'tag':'v8-'+version})
+    runs = pages(gh, gh.base+'/actions/workflows/release.yml/runs?status=completed', 'workflow_runs')
+    for run in runs:
+        if run['id'] == current_run_id: continue
+        if run.get('event') not in ('schedule','workflow_dispatch') or run.get('head_branch') != graph.repository['defaultBranch']: continue
+        try: node=graph.resolve(run['id'])
+        except (ValueError,KeyError,subprocess.CalledProcessError): continue
+        if node['pins'] != expected_pins: continue
+        candidate=(len(node['sdks']),len(node['runtimes']))
+        if candidate>score: best=node;score=candidate
+        if score==(len(TARGETS),len(RUNTIME)): break
+    if best and score[0]>0: return compose_plan(graph,best,root,builder_revision)
+    base=json.loads((Path(root)/'tool/v8/pins.json').read_text())
+    pins=make_pins(base,{'version':version,'revision':revision,'tag':'v8-'+version})
+    packaging=current_recipe(root,builder_revision)
+    return {'schemaVersion':2,'sourceRunId':None,'repository':graph.repository,'packagingRevision':builder_revision,
+            'packagingInputHashes':packaging,'producerRecipes':{},'sourceRuns':{},'metadataAssets':{},'pins':pins,
+            'sdkAssets':{},'assets':{},'runtimeAssets':{},'runtimeRequired':list(RUNTIME.values()),
+            'rebuildTargets':list(TARGETS),'targets':{t:{'producerRevision':builder_revision,'producerInputHashes':packaging} for t in TARGETS}}
+
+
+validate_plan = validate_generic_plan
+plan = generic_plan
+download = download_generic
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('action',choices=['plan','auto','download','probe'])
+    p.add_argument('--repository',required=True);p.add_argument('--source-run-id','--run-id',dest='run_id',type=int)
+    p.add_argument('--plan',type=Path,default=Path('reuse-plan.json'));p.add_argument('--output',type=Path)
+    p.add_argument('--builder-revision');p.add_argument('--github-output',type=Path)
+    p.add_argument('--targets',default='');p.add_argument('--only-target',choices=TARGETS)
+    p.add_argument('--runtime-name',choices=RUNTIME);p.add_argument('--probe-only',action='store_true');p.add_argument('--detection',type=Path);p.add_argument('--current-run-id',type=int)
+    a=p.parse_args()
+    if a.action=='auto':
+        detection=json.loads(a.detection.read_text())
+        if type(detection.get('should_build')) is not bool: raise ValueError('Explicit detector build decision required')
+        if detection['should_build'] is False:
+            if a.github_output:
+                with a.github_output.open('a') as stream: stream.write('should_build=false\n')
+            return
+    gh=GitHub(a.repository,os.environ['GH_TOKEN'])
+    if a.action in ('plan','auto'):
+        if a.action=='auto':
+            detection=json.loads(a.detection.read_text());value=auto_plan(gh,Path('.'),a.builder_revision,detection['version'],detection['revision'],a.current_run_id)
+        else: value=generic_plan(gh,Path('.'),a.builder_revision,a.run_id,a.targets.split(',') if a.targets else None)
+        if a.targets and (len(a.targets.split(',')) != len(set(a.targets.split(','))) or set(a.targets.split(',')) != set(value['rebuildTargets'])):
+            raise ValueError('Requested targets must equal missing SDKs')
+        validate_generic_plan(value,value['pins'],a.builder_revision)
+        a.plan.write_text(json.dumps(value,indent=2)+'\n');Path('stable-pins.json').write_text(json.dumps(value['pins'],indent=2)+'\n')
+        if a.github_output:
+            outputs={'should_build':'true','version':value['pins']['v8']['version'],'revision':value['pins']['v8']['revision'],'tag':'v8-'+value['pins']['v8']['version'],
+                     'build_count':str(len(value['rebuildTargets'])),'reuse_count':str(len(value['sdkAssets'])),
+                     'linux_runtime_required':str('linux-arm64' in value['runtimeRequired']).lower(),
+                     'windows_runtime_required':str('windows-arm64' in value['runtimeRequired']).lower(),
+                     'linux_sdk_reused':str('linux-arm64' in value['sdkAssets']).lower(),
+                     'windows_sdk_reused':str('windows-arm64' in value['sdkAssets']).lower()}
+            with a.github_output.open('a') as stream:
+                for key,val in outputs.items():stream.write(key+'='+val+'\n')
+    else:
+        value=json.loads(a.plan.read_text());download_generic(gh,value,a.output,a.action=='probe' or a.probe_only,a.only_target,a.runtime_name)
+
+
+if __name__=='__main__': main()
