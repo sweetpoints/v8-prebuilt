@@ -298,7 +298,14 @@ def gn_arguments(target, pins=None):
     if target.startswith('android-'):
         args.update(target_os='android', android_ndk_api_level=26)
     else:
-        args.update(target_os='mac', mac_deployment_target='13.0', use_lld=False)
+        # A static SDK may be dlopen-ed by an already multithreaded host.
+        # Apple's allocator shim replaces the process default malloc zone in
+        # a constructor, racing concurrent frees during zone registration.
+        # Keep explicit V8/PartitionAlloc allocations available without taking
+        # ownership of the embedder's malloc. PA f0d1e646's GN contract permits
+        # independent partitions (including BRP) without PA-as-malloc.
+        args.update(target_os='mac', mac_deployment_target='13.0', use_lld=False,
+                    use_allocator_shim=False, use_partition_alloc_as_malloc=False)
     return '\n'.join(f'{key} = {json.dumps(value)}' for key, value in sorted(args.items())) + '\n'
 
 
