@@ -132,6 +132,172 @@ class GenericResumeTests(unittest.TestCase):
         return resume.generic_plan(self.api, self.root, self.builder,
                                    run_id or self.FIRST, targets)
 
+    def revision_plan(self, revision=1, run_id=None, replaces=None, targets=None):
+        return resume.generic_plan(self.api, self.root, self.builder, run_id or self.FIRST,
+                                   targets, revision, list(resume.MAC_REPLACEMENTS) if replaces is None else replaces)
+
+    def test_sdk_revision_replaces_two_macs_reuses_eight_and_keeps_source_pins(self):
+        value = self.revision_plan(revision=2)
+        self.assertEqual('v8-15.5.35.21-sdk.2', value['releaseTag'])
+        self.assertEqual(2, value['sdkArtifactRevision'])
+        self.assertEqual(list(resume.MAC_REPLACEMENTS), value['rebuildTargets'])
+        self.assertEqual(self.pins, value['pins'])
+        self.assertEqual(8, len(value['sdkAssets']))
+        self.assertEqual(set(resume.MAC_REPLACEMENTS), set(value['replacementAssets']))
+        for target, record in value['replacementAssets'].items():
+            self.assertEqual(self.api.named(self.FIRST, 'v8-' + target)['id'], record['id'])
+            self.assertEqual(self.producer, record['producerRevision'])
+            self.assertEqual(self.builder, value['targets'][target]['producerRevision'])
+        for target in value['sdkAssets']:
+            self.assertEqual(self.producer, value['targets'][target]['producerRevision'])
+        resume.validate_generic_plan(value, self.pins, self.builder, root=self.root)
+
+    def test_cli_revision_keeps_v8_25_identity_and_emits_exact_new_release_tag(self):
+        self.pins['v8'].update(version='15.4.80.25', revision='c45871fec706a6e7b715e607065bb4578b23ce9f')
+        self.api = FakeGitHub()
+        self.api.add_run(self.FIRST, self.producer, list(resume.TARGETS), self.pins)
+        output = self.root / 'outputs'
+        argv = ['release_resume.py', 'plan', '--repository', 'sweetpoints/v8-prebuilt',
+                '--source-run-id', str(self.FIRST), '--sdk-artifact-revision', '1',
+                '--replaces-targets', 'macos-x64,macos-arm64', '--builder-revision', self.builder,
+                '--github-output', str(output)]
+        original = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with patch('sys.argv', argv), patch.object(resume, 'GitHub', return_value=self.api), \
+                    patch.dict(os.environ, {'GH_TOKEN': 'fixture-token'}):
+                resume.main()
+            value = json.loads((self.root / 'reuse-plan.json').read_text())
+            emitted = dict(line.split('=', 1) for line in output.read_text().splitlines())
+            self.assertEqual('v8-15.4.80.25-sdk.1', emitted['tag'])
+            self.assertEqual('1', emitted['sdk_artifact_revision'])
+            self.assertEqual('macos-arm64,macos-x64', emitted['replaces_targets'])
+            self.assertEqual('2', emitted['build_count'])
+            self.assertEqual('8', emitted['reuse_count'])
+            self.assertEqual(self.pins, value['pins'])
+            self.assertEqual(self.pins, json.loads((self.root / 'stable-pins.json').read_text()))
+        finally:
+            os.chdir(original)
+
+    def test_sdk_revision_requires_exact_explicit_mac_pair_and_positive_integer(self):
+        for targets in [[], ['macos-arm64'], ['linux-x64', 'macos-arm64'],
+                        ['macos-arm64', 'macos-x64', 'macos-x64']]:
+            with self.subTest(targets=targets), self.assertRaises(ValueError):
+                self.revision_plan(replaces=targets)
+        for revision in [-1, True, 1.0, '1']:
+            with self.subTest(revision=revision), self.assertRaises(ValueError):
+                self.revision_plan(revision=revision)
+        with self.assertRaises(ValueError):
+            resume.generic_plan(self.api, self.root, self.builder, 'auto',
+                                sdk_artifact_revision=1, replaces_targets=list(resume.MAC_REPLACEMENTS))
+        with self.assertRaises(ValueError):
+            resume.generic_plan(self.api, self.root, self.builder, None,
+                                sdk_artifact_revision=1, replaces_targets=list(resume.MAC_REPLACEMENTS))
+        with self.assertRaises(ValueError):
+            self.revision_plan(revision=0)
+
+    def test_revision_expired_or_missing_baseline_sdk_fails_without_full_rebuild(self):
+        for target in ['macos-arm64', 'linux-x64']:
+            with self.subTest(target=target):
+                item = self.api.named(self.FIRST, 'v8-' + target)
+                item['expired'] = True
+                with self.assertRaisesRegex(ValueError, 'all ten authenticated'):
+                    self.revision_plan()
+                item['expired'] = False
+
+    def test_revision_cannot_rebuild_successful_nonmac_or_change_frozen_contract(self):
+        with self.assertRaises(ValueError):
+            self.revision_plan(targets=['macos-arm64', 'macos-x64', 'android-arm64'])
+        changed = copy.deepcopy(self.pins)
+        changed['depotTools']['revision'] = 'a' * 40
+        item = self.api.named(self.FIRST, 'stable-pins')
+        del self.api.artifacts[item['id']]
+        self.api.add_artifact(self.FIRST, self.producer, 'stable-pins', archive('stable-pins.json', changed))
+        with self.assertRaises(ValueError):
+            self.revision_plan()
+
+    def test_revision_still_rejects_pr_source_runs(self):
+        self.api.runs[self.FIRST]['event'] = 'pull_request'
+        with self.assertRaisesRegex(ValueError, 'Untrusted source run'):
+            self.revision_plan()
+
+    def test_revision_partial_run_resumes_only_missing_mac_without_rebuilding_success(self):
+        graph = resume.Graph(self.api, self.root, self.second_producer)
+        saved = resume.compose_plan(graph, graph.resolve(self.FIRST), self.root,
+                                    self.second_producer, sdk_artifact_revision=1,
+                                    replaces_targets=list(resume.MAC_REPLACEMENTS))
+        self.api.add_run(self.SECOND, self.second_producer, ['macos-arm64'], self.pins,
+                         event='workflow_dispatch')
+        self.api.add_artifact(self.SECOND, self.second_producer, 'reuse-plan', archive('reuse-plan.json', saved))
+        value = self.revision_plan(run_id=self.SECOND)
+        self.assertEqual(['macos-x64'], value['rebuildTargets'])
+        self.assertEqual(9, len(value['sdkAssets']))
+        self.assertEqual(self.second_producer, value['targets']['macos-arm64']['producerRevision'])
+        self.assertEqual(saved['replacementAssets'], value['replacementAssets'])
+        resume.validate_generic_plan(value, self.pins, self.builder, root=self.root)
+        with self.assertRaises(ValueError):
+            self.revision_plan(run_id=self.SECOND, targets=list(resume.MAC_REPLACEMENTS))
+        with self.assertRaises(ValueError):
+            self.plan(self.SECOND)
+        with self.assertRaises(ValueError):
+            self.revision_plan(run_id=self.SECOND, revision=2)
+
+    def test_archived_revision_cannot_relabel_replaced_mac_or_rebuild_nonmac(self):
+        graph = resume.Graph(self.api, self.root, self.second_producer)
+        original = resume.compose_plan(graph, graph.resolve(self.FIRST), self.root,
+                                      self.second_producer, sdk_artifact_revision=1,
+                                      replaces_targets=list(resume.MAC_REPLACEMENTS))
+        for mutate in [lambda v: v['replacementAssets']['macos-arm64'].update(sha256='0' * 64),
+                       lambda v: v['rebuildTargets'].append('linux-x64')]:
+            with self.subTest(mutate=mutate):
+                self.api.add_run(self.SECOND, self.second_producer, ['macos-arm64'], self.pins)
+                saved = copy.deepcopy(original)
+                mutate(saved)
+                item = self.api.named(self.SECOND, 'reuse-plan') if any(
+                    a['name'] == 'reuse-plan' and a['workflow_run']['id'] == self.SECOND
+                    for a in self.api.artifacts.values()) else None
+                if item is not None:
+                    del self.api.artifacts[item['id']]
+                self.api.add_artifact(self.SECOND, self.second_producer, 'reuse-plan', archive('reuse-plan.json', saved))
+                with self.assertRaises(ValueError):
+                    self.revision_plan(run_id=self.SECOND)
+                for item in list(self.api.artifacts.values()):
+                    if item['workflow_run']['id'] == self.SECOND:
+                        del self.api.artifacts[item['id']]
+
+    def test_revision_keeps_successful_arm_runtime_proofs_bound_to_unchanged_sdks(self):
+        for name in resume.RUNTIME:
+            self.api.jobs[self.FIRST].append({'name': name, 'conclusion': 'success'})
+            self.api.add_artifact(self.FIRST, self.producer, name,
+                                  archive('sdk-smoke.json', {'fixtureRuntime': True}))
+        value = self.revision_plan()
+        self.assertEqual([], value['runtimeRequired'])
+        for name, target in resume.RUNTIME.items():
+            self.assertEqual(value['sdkAssets'][target]['id'], value['runtimeAssets'][name]['sdkArtifactId'])
+            self.assertEqual(value['sdkAssets'][target]['sha256'], value['runtimeAssets'][name]['sdkArtifactSha256'])
+        resume.validate_generic_plan(value, self.pins, self.builder, root=self.root)
+
+    def test_revision_plan_tamper_tag_inventory_and_replacement_origin_rejected(self):
+        original = self.revision_plan()
+        for change in [lambda v: v.update(releaseTag='v8-15.5.35.21'),
+                       lambda v: v.pop('releaseTag'),
+                       lambda v: v.update(sourceRunId=99112233),
+                       lambda v: v.update(replacesTargets=['macos-arm64']),
+                       lambda v: v['replacementAssets'].pop('macos-x64'),
+                       lambda v: v['replacementAssets']['macos-arm64'].update(producerRevision='f' * 40)]:
+            value = copy.deepcopy(original)
+            change(value)
+            with self.assertRaises(ValueError):
+                resume.validate_generic_plan(value, self.pins, self.builder, root=self.root)
+
+    def test_cli_positive_revision_auto_rejected_before_api_or_detection(self):
+        argv = ['release_resume.py', 'auto', '--repository', 'sweetpoints/v8-prebuilt',
+                '--sdk-artifact-revision', '1', '--replaces-targets', 'macos-arm64,macos-x64']
+        with patch('sys.argv', argv), patch.object(resume, 'GitHub') as client:
+            with self.assertRaisesRegex(ValueError, 'fixed trusted source run'):
+                resume.main()
+            client.assert_not_called()
+
     def test_arbitrary_run_all_ten_present_requires_no_native_rebuild(self):
         value = self.plan()
         self.assertEqual([], value['rebuildTargets'])
@@ -291,7 +457,7 @@ class GenericResumeTests(unittest.TestCase):
         original = Path.cwd()
         try:
             os.chdir(self.root)
-            for missing in [list(resume.TARGETS), ['ios-arm64', 'ios-simulator-arm64'], []]:
+            for missing in [list(resume.TARGETS), ['ios-arm64', 'ios-simulator-arm64'], list(resume.MAC_REPLACEMENTS), []]:
                 with self.subTest(missing=missing):
                     sdk = {target: {} for target in resume.TARGETS if target not in missing}
                     (self.root / 'reuse-plan.json').write_text(json.dumps({'rebuildTargets': missing, 'sdkAssets': sdk}))
