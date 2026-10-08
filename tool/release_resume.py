@@ -12,13 +12,32 @@ import stat
 import zipfile
 from release_package import TARGETS
 from release_publish import GitHub
-from release_pins import make_pins
+from release_pins import make_pins, release_tag
 import git_inputs
 
 INPUTS = ('tool/v8/build.py', 'tool/v8/desktop.py', 'tool/v8/ios.py', 'tool/sdk_smoke.py', 'tool/v8/pins.json')
 WORKFLOW = '.github/workflows/release.yml'
 RUNTIME = {'linux-arm-runtime': 'linux-arm64', 'windows-arm-runtime': 'windows-arm64'}
 MAX_DEPTH = 32
+MAC_REPLACEMENTS = ('macos-arm64', 'macos-x64')
+
+
+def revision_identity(value):
+    revision = value.get('sdkArtifactRevision', 0)
+    tag = release_tag(value['pins']['v8']['version'], revision)
+    if value.get('releaseTag', tag) != tag or (revision and 'releaseTag' not in value):
+        raise ValueError('SDK artifact revision tag differs')
+    replacements = value.get('replacesTargets', [])
+    if replacements != (list(MAC_REPLACEMENTS) if revision else []):
+        raise ValueError('SDK revisions must explicitly replace exactly both Mac targets')
+    records = value.get('replacementAssets', {})
+    if not isinstance(records, dict) or set(records) != set(replacements):
+        raise ValueError('SDK replacement provenance inventory differs')
+    if revision and (type(value.get('sourceRunId')) is not int or value['sourceRunId'] <= 0):
+        raise ValueError('SDK revision requires a fixed trusted source run')
+    if any(not isinstance(record, dict) for record in records.values()):
+        raise ValueError('SDK replacement provenance records required')
+    return revision, tag, replacements, records
 
 class ArtifactIntegrityError(ValueError):
     pass
@@ -166,7 +185,7 @@ class Graph:
             expected_pins = make_pins(committed_base, {'version': pins['v8']['version'],
                          'revision': pins['v8']['revision'], 'tag': 'v8-' + pins['v8']['version']})
             if pins != expected_pins: raise ValueError('Frozen pins differ from source producer recipe')
-            node = {'run': run, 'pins': pins, 'sdks': {}, 'runtimes': {}, 'probes': {}, 'metadata': {'stable-pins': pin_record}}
+            node = {'run': run, 'pins': pins, 'sdkArtifactRevision': 0, 'sdks': {}, 'runtimes': {}, 'probes': {}, 'metadata': {'stable-pins': pin_record}}
             if 'reuse-plan' in index:
                 plan_record = artifact_record(index['reuse-plan'], run)
                 saved = json_artifact(self.gh, plan_record, 'reuse-plan.json')
@@ -175,7 +194,21 @@ class Graph:
                 parent_id = saved.get('sourceRunId') or saved.get('reuseRunId')
                 parents = {parent_id} if parent_id is not None else set()
                 parents.update(o['reuseProvenance']['runId'] for o in saved.get('targets', {}).values() if 'reuseProvenance' in o)
+                revision, tag, replacements, records = revision_identity(saved)
+                parents.update(r['runId'] for r in records.values())
                 parent_nodes = {identifier: self.resolve(identifier) for identifier in parents}
+                if revision:
+                    if (set(saved.get('targets', {})) != set(TARGETS)
+                            or not set(saved.get('rebuildTargets', [])).issubset(replacements)
+                            or any('reuseProvenance' not in saved['targets'][target]
+                                   for target in TARGETS if target not in replacements)):
+                        raise ValueError('Archived SDK revision cannot rebuild non-Mac targets')
+                    for target, record in records.items():
+                        parent = parent_nodes.get(record.get('runId'))
+                        if parent is None or parent['sdks'].get(target) != record:
+                            raise ValueError('Archived SDK replacement proof differs from authenticated origin')
+                    node.update(sdkArtifactRevision=revision, releaseTag=tag,
+                                replacesTargets=replacements, replacementAssets=records)
                 for parent in parent_nodes.values():
                     if parent['pins'] != pins: raise ValueError('Reuse graph source pins differ')
                     node['runtimes'].update(parent['runtimes']); node['probes'].update(parent['probes'])
@@ -226,37 +259,69 @@ class Graph:
         finally: self.active.remove(run_id)
 
 
-def compose_plan(graph, node, root, builder_revision, targets=None):
+def compose_plan(graph, node, root, builder_revision, targets=None, sdk_artifact_revision=0, replaces_targets=None):
     base=json.loads((Path(root)/'tool/v8/pins.json').read_text())
     expected=make_pins(base,{'version':node['pins']['v8']['version'],'revision':node['pins']['v8']['revision'],'tag':'v8-'+node['pins']['v8']['version']})
     if expected != node['pins']: raise ValueError('Frozen source pins differ from current target/depot contracts')
-    missing = [t for t in TARGETS if t not in node['sdks']]
+    tag = release_tag(node['pins']['v8']['version'], sdk_artifact_revision)
+    replacements = sorted(replaces_targets or [])
+    if len(replacements) != len(set(replacements)) or replacements != (list(MAC_REPLACEMENTS) if sdk_artifact_revision else []):
+        raise ValueError('SDK revisions must explicitly replace exactly both Mac targets')
+    previous_revision = node.get('sdkArtifactRevision', 0)
+    if previous_revision > sdk_artifact_revision:
+        raise ValueError('Cannot resume an SDK revision as an older release identity')
+    sdks = dict(node['sdks'])
+    replacement_assets = {}
+    if sdk_artifact_revision:
+        if previous_revision == sdk_artifact_revision:
+            if node.get('replacesTargets') != replacements:
+                raise ValueError('Resumed SDK replacement targets differ')
+            replacement_assets = node['replacementAssets']
+        else:
+            if set(sdks) != set(TARGETS):
+                raise ValueError('SDK revision requires all ten authenticated baseline SDKs; expired or missing artifacts cannot rebuild silently')
+            replacement_assets = {target: sdks.pop(target) for target in replacements}
+    missing = [t for t in TARGETS if t not in sdks]
+    if sdk_artifact_revision and not set(missing).issubset(replacements):
+        raise ValueError('SDK revision cannot rebuild missing non-Mac baseline artifacts')
     if targets is not None and (len(targets)!=len(set(targets)) or set(targets) != set(missing)): raise ValueError('Requested targets must equal missing targets; successful SDKs cannot rebuild')
-    recipes = {r['producerRevision']: snapshot_inputs(root, r['producerRevision']) for r in node['sdks'].values()}
+    recipes = {r['producerRevision']: snapshot_inputs(root, r['producerRevision']) for r in [*sdks.values(), *replacement_assets.values()]}
     packaging = current_recipe(root, builder_revision)
     origins = {}
     for target in TARGETS:
-        if target in node['sdks']:
-            r = node['sdks'][target]
+        if target in sdks:
+            r = sdks[target]
             origins[target] = {'producerRevision': r['producerRevision'], 'reuseProvenance': {
                 'runId': r['runId'], 'artifactId': r['id'], 'artifactSha256': r['sha256'],
                 'producerInputHashes': recipes[r['producerRevision']]}}
         else: origins[target] = {'producerRevision': builder_revision, 'producerInputHashes': packaging}
-    return {'schemaVersion': 2, 'sourceRunId': node['run']['id'], 'repository': graph.repository,
+    value = {'schemaVersion': 2, 'sourceRunId': node['run']['id'], 'repository': graph.repository,
             'packagingRevision': builder_revision, 'packagingInputHashes': packaging, 'producerRecipes': recipes,
             'sourceRuns': {str(k): v['run'] for k, v in graph.nodes.items()}, 'pins': node['pins'],
             'metadataAssets': {str(k): v['metadata'] for k, v in graph.nodes.items()},
-            'sdkAssets': node['sdks'], 'assets': {'v8-' + t: r for t, r in node['sdks'].items()} | node['probes'],
+            'sdkAssets': sdks, 'assets': {'v8-' + t: r for t, r in sdks.items()} | node['probes'],
             'runtimeAssets': node['runtimes'], 'runtimeRequired': [t for n,t in RUNTIME.items() if n not in node['runtimes']],
             'rebuildTargets': missing, 'targets': origins}
+    if sdk_artifact_revision:
+        value.update(sdkArtifactRevision=sdk_artifact_revision, releaseTag=tag,
+                     replacesTargets=replacements, replacementAssets=replacement_assets)
+    return value
 
 
-def generic_plan(gh, root, builder_revision, run_id, targets=None):
+def generic_plan(gh, root, builder_revision, run_id, targets=None, sdk_artifact_revision=0, replaces_targets=None):
+    release_tag('0.0.0', sdk_artifact_revision)
     if run_id == 'auto':
+        if sdk_artifact_revision or replaces_targets:
+            raise ValueError('SDK revision requires a fixed trusted source run; automatic selection is forbidden')
         base = json.loads((Path(root) / 'tool/v8/pins.json').read_text())
         return auto_plan(gh, root, builder_revision, base['v8']['version'], base['v8']['revision'])
+    if isinstance(run_id, str) and re.fullmatch('[1-9][0-9]*', run_id):
+        run_id = int(run_id)
+    if type(run_id) is not int or run_id <= 0:
+        raise ValueError('Positive fixed source run ID required')
     graph = Graph(gh, root, builder_revision)
-    return compose_plan(graph, graph.resolve(int(run_id)), root, builder_revision, targets)
+    return compose_plan(graph, graph.resolve(run_id), root, builder_revision, targets,
+                        sdk_artifact_revision, replaces_targets)
 
 
 def validate_generic_plan(value, pins, builder_revision, root=None):
@@ -268,8 +333,24 @@ def validate_generic_plan(value, pins, builder_revision, root=None):
             or value.get('packagingInputHashes') != current_recipe(root, builder_revision)
             or set(value.get('targets', {})) != set(TARGETS)):
         raise ValueError('Generic plan source/packaging recipe differs')
+    revision, tag, replacements, records = revision_identity(value)
+    if revision and str(value['sourceRunId']) not in value.get('sourceRuns', {}):
+        raise ValueError('SDK revision source run lacks authenticated provenance')
+    for target, record in records.items():
+        run = value['sourceRuns'].get(str(record.get('runId')))
+        if (not run or run['head_sha'] != record.get('producerRevision')
+                or not ancestor(root, record['producerRevision'], builder_revision)
+                or value['producerRecipes'].get(record['producerRevision']) != snapshot_inputs(root, record['producerRevision'])
+                or record.get('name') != 'v8-' + target or type(record.get('id')) is not int
+                or not re.fullmatch('[0-9a-f]{64}', record.get('sha256', ''))
+                or type(record.get('size')) is not int or record['size'] <= 0):
+            raise ValueError('Immutable replacement SDK producer proof differs')
+        if value.get('metadataAssets', {}).get(str(record['runId'])) is None:
+            raise ValueError('Replacement SDK lacks authenticated source metadata')
     expected_missing = [t for t in TARGETS if t not in value.get('sdkAssets', {})]
     if value.get('rebuildTargets') != expected_missing: raise ValueError('Missing target inventory differs')
+    if revision and not set(expected_missing).issubset(replacements):
+        raise ValueError('SDK revision cannot rebuild missing non-Mac baseline artifacts')
     for target, origin in value['targets'].items():
         if target in expected_missing:
             if origin != {'producerRevision': builder_revision, 'producerInputHashes': value['packagingInputHashes']}:
@@ -333,7 +414,7 @@ def auto_plan(gh, root, builder_revision, version, revision, current_run_id=None
         try: node=graph.resolve(run['id'])
         except ArtifactIntegrityError: raise
         except (ValueError,KeyError,subprocess.CalledProcessError): continue
-        if node['pins'] != expected_pins: continue
+        if node['pins'] != expected_pins or node.get('sdkArtifactRevision', 0): continue
         candidate=(len(node['sdks']),len(node['runtimes']))
         if candidate>score: best=node;score=candidate
         if score==(len(TARGETS),len(RUNTIME)): break
@@ -358,9 +439,13 @@ def main():
     p.add_argument('--repository',required=True);p.add_argument('--source-run-id','--run-id',dest='run_id',type=int)
     p.add_argument('--plan',type=Path,default=Path('reuse-plan.json'));p.add_argument('--output',type=Path)
     p.add_argument('--builder-revision');p.add_argument('--github-output',type=Path)
+    p.add_argument('--sdk-artifact-revision', type=int, default=0);p.add_argument('--replaces-targets', default='');
     p.add_argument('--targets',default='');p.add_argument('--only-target',choices=TARGETS)
     p.add_argument('--runtime-name',choices=RUNTIME);p.add_argument('--probe-only',action='store_true');p.add_argument('--detection',type=Path);p.add_argument('--current-run-id',type=int)
     a=p.parse_args()
+    release_tag('0.0.0', a.sdk_artifact_revision)
+    if a.action == 'auto' and (a.sdk_artifact_revision or a.replaces_targets):
+        raise ValueError('SDK revision requires a fixed trusted source run; automatic selection is forbidden')
     if a.action=='auto':
         detection=json.loads(a.detection.read_text())
         if type(detection.get('should_build')) is not bool: raise ValueError('Explicit detector build decision required')
@@ -372,13 +457,15 @@ def main():
     if a.action in ('plan','auto'):
         if a.action=='auto':
             detection=json.loads(a.detection.read_text());value=auto_plan(gh,Path('.'),a.builder_revision,detection['version'],detection['revision'],a.current_run_id)
-        else: value=generic_plan(gh,Path('.'),a.builder_revision,a.run_id,a.targets.split(',') if a.targets else None)
+        else: value=generic_plan(gh,Path('.'),a.builder_revision,a.run_id,a.targets.split(',') if a.targets else None,a.sdk_artifact_revision,a.replaces_targets.split(',') if a.replaces_targets else None)
         if a.targets and (len(a.targets.split(',')) != len(set(a.targets.split(','))) or set(a.targets.split(',')) != set(value['rebuildTargets'])):
             raise ValueError('Requested targets must equal missing SDKs')
-        validate_generic_plan(value,value['pins'],a.builder_revision)
+        validate_generic_plan(value,value['pins'],a.builder_revision,root=Path('.'))
         a.plan.write_text(json.dumps(value,indent=2)+'\n');Path('stable-pins.json').write_text(json.dumps(value['pins'],indent=2)+'\n')
         if a.github_output:
-            outputs={'should_build':'true','version':value['pins']['v8']['version'],'revision':value['pins']['v8']['revision'],'tag':'v8-'+value['pins']['v8']['version'],
+            outputs={'should_build':'true','version':value['pins']['v8']['version'],'revision':value['pins']['v8']['revision'],'tag':release_tag(value['pins']['v8']['version'],value.get('sdkArtifactRevision',0)),
+                     'sdk_artifact_revision':str(value.get('sdkArtifactRevision',0)),
+                     'replaces_targets':','.join(value.get('replacesTargets',[])),
                      'build_count':str(len(value['rebuildTargets'])),'reuse_count':str(len(value['sdkAssets'])),
                      'linux_runtime_required':str('linux-arm64' in value['runtimeRequired']).lower(),
                      'windows_runtime_required':str('windows-arm64' in value['runtimeRequired']).lower(),
