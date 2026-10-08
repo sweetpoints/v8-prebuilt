@@ -19,6 +19,16 @@ on:
         type: string
         required: false
         default: ""
+      sdk_artifact_revision:
+        description: Immutable SDK recipe revision; positive revisions require a fixed trusted source run
+        type: string
+        required: false
+        default: "0"
+      replaces_targets:
+        description: For a positive revision, exactly macos-arm64,macos-x64; ordinary recovery leaves empty
+        type: string
+        required: false
+        default: ""
 permissions:
   contents: read
   actions: read
@@ -33,6 +43,8 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       revision: ${{ steps.plan.outputs.revision }}
       tag: ${{ steps.plan.outputs.tag }}
+      sdk_artifact_revision: ${{ steps.plan.outputs.sdk_artifact_revision }}
+      replaces_targets: ${{ steps.plan.outputs.replaces_targets }}
       matrix: ${{ steps.matrix.outputs.value }}
       build_count: ${{ steps.matrix.outputs.build_count }}
       reuse_count: ${{ steps.matrix.outputs.reuse_count }}
@@ -48,7 +60,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Detect official stable V8 source
-        if: inputs.source_run_id == '' && inputs.reuse_run_id == ''
+        if: inputs.source_run_id == '' && inputs.reuse_run_id == '' && (inputs.sdk_artifact_revision == '' || inputs.sdk_artifact_revision == '0') && inputs.replaces_targets == ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: python tool/detect_stable.py --repository "$GITHUB_REPOSITORY" --output detection.json
@@ -59,15 +71,23 @@ jobs:
           SOURCE_RUN_ID: ${{ inputs.source_run_id || '' }}
           REUSE_RUN_ID: ${{ inputs.reuse_run_id || '' }}
           REBUILD_TARGETS: ${{ inputs.targets || '' }}
+          SDK_ARTIFACT_REVISION: ${{ inputs.sdk_artifact_revision || '0' }}
+          REPLACES_TARGETS: ${{ inputs.replaces_targets || '' }}
         run: |
           if [[ -n "$SOURCE_RUN_ID" && -n "$REUSE_RUN_ID" && "$SOURCE_RUN_ID" != "$REUSE_RUN_ID" ]]; then
             echo 'source_run_id and reuse_run_id must agree' >&2; exit 1
           fi
           task_source_run="${SOURCE_RUN_ID:-$REUSE_RUN_ID}"
+          if [[ ! "$SDK_ARTIFACT_REVISION" =~ ^(0|[1-9][0-9]*)$ ]]; then
+            echo 'sdk_artifact_revision must be a canonical nonnegative integer' >&2; exit 1
+          fi
+          if [[ "$SDK_ARTIFACT_REVISION" != "0" && -z "$task_source_run" ]]; then
+            echo 'SDK revisions require a fixed trusted source run' >&2; exit 1
+          fi
           if [[ -n "$task_source_run" ]]; then
-            python tool/release_resume.py plan --repository "$GITHUB_REPOSITORY" --source-run-id "$task_source_run" --targets "$REBUILD_TARGETS" --builder-revision "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
+            python tool/release_resume.py plan --repository "$GITHUB_REPOSITORY" --source-run-id "$task_source_run" --sdk-artifact-revision "$SDK_ARTIFACT_REVISION" --replaces-targets "$REPLACES_TARGETS" --targets "$REBUILD_TARGETS" --builder-revision "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
           else
-            python tool/release_resume.py auto --repository "$GITHUB_REPOSITORY" --detection detection.json --current-run-id "$GITHUB_RUN_ID" --targets "$REBUILD_TARGETS" --builder-revision "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
+            python tool/release_resume.py auto --repository "$GITHUB_REPOSITORY" --detection detection.json --current-run-id "$GITHUB_RUN_ID" --sdk-artifact-revision "$SDK_ARTIFACT_REVISION" --replaces-targets "$REPLACES_TARGETS" --targets "$REBUILD_TARGETS" --builder-revision "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
           fi
       - name: Select only genuinely missing SDK targets
         id: matrix

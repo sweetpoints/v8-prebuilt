@@ -9,6 +9,8 @@ import re
 import urllib.error
 import urllib.request
 import urllib.parse
+import tarfile
+from release_pins import release_tag, release_metadata
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
@@ -74,7 +76,10 @@ class GitHub:
 
 def publish(directory, repository, token, github=None):
     manifest = json.loads((directory / 'release-manifest.json').read_text())
-    from release_package import TARGETS
+    from release_package import TARGETS, verify_feature_profile_data
+    metadata = release_metadata(manifest, manifest['v8']['version'])
+    sdk_revision = metadata.get('sdkArtifactRevision', 0)
+    tag = release_tag(manifest['v8']['version'], sdk_revision)
     if set(manifest['targets']) != set(TARGETS):
         raise ValueError('complete ten-target release required')
     expected_assets = {f"v8-{manifest['v8']['version']}-{target}.tar.gz" for target in TARGETS} | {'pins.json'}
@@ -103,12 +108,21 @@ def publish(directory, repository, token, github=None):
         path = directory / item['name']
         if path.name != item['name'] or path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256'] or path.stat().st_size != item['size']:
             raise ValueError('local release asset integrity failed')
+    if sdk_revision:
+        for target in metadata['replacesTargets']:
+            with tarfile.open(directory / f"v8-{manifest['v8']['version']}-{target}.tar.gz", 'r:gz') as archive:
+                def read_member(name):
+                    entries = [item for item in archive.getmembers() if item.name == name]
+                    if len(entries) != 1 or not entries[0].isfile() or entries[0].size > 1024 * 1024:
+                        raise ValueError('SDK revision Mac feature evidence required')
+                    return archive.extractfile(entries[0]).read().decode('utf-8')
+                verify_feature_profile_data(json.loads(read_member(target + '/linking.json')),
+                                            read_member(target + '/args.gn'), target, sdk_revision)
     checksum_names = names - {'SHA256SUMS'}
     expected_checksums = ''.join(f"{hashlib.sha256((directory / name).read_bytes()).hexdigest()}  {name}\n" for name in sorted(checksum_names))
     if (directory / 'SHA256SUMS').read_text() != expected_checksums:
         raise ValueError('release checksum index differs')
     gh = github or GitHub(repository, token)
-    tag = 'v8-' + manifest['v8']['version']
     release = gh.by_tag(tag)
     tag_revision = gh.tag_revision(tag)
     if tag_revision is not None and tag_revision != manifest['builderRevision']:
@@ -124,16 +138,23 @@ def publish(directory, repository, token, github=None):
     if not release['draft'] and tag_revision != manifest['builderRevision']:
         raise ValueError('published release tag identity differs')
     existing = {a['name']: a for a in release['assets']}
+    if len(existing) != len(release['assets']):
+        raise ValueError('duplicate remote release assets')
     if set(existing) - names:
         raise ValueError('unexpected remote release assets')
     if not release['draft'] and set(existing) != names:
         raise ValueError('published release is incomplete; refusing mutation')
+    # Check every existing object before uploading any missing draft asset.
+    # A late-name conflict must not cause a partially mutated draft.
+    for name in sorted(existing):
+        payload = (directory / name).read_bytes()
+        actual = gh.asset_bytes(existing[name])
+        if not isinstance(actual, bytes) or hashlib.sha256(actual).digest() != hashlib.sha256(payload).digest():
+            raise ValueError('existing release asset differs; refusing overwrite')
     for name in sorted(names):
         payload = (directory / name).read_bytes()
         if name in existing:
-            actual = gh.asset_bytes(existing[name])
-            if not isinstance(actual, bytes) or hashlib.sha256(actual).digest() != hashlib.sha256(payload).digest():
-                raise ValueError('existing release asset differs; refusing overwrite')
+            continue
         elif release['draft']:
             url = release['upload_url'].split('{', 1)[0] + '?name=' + name
             gh.request(url, 'POST', payload, 'application/octet-stream')

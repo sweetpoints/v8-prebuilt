@@ -472,6 +472,16 @@ class ReleaseTests(unittest.TestCase):
         gh.release = {'id': 1, 'draft': True, 'tag_name': 'v8-15.4.80.24', 'target_commitish': 'd' * 40, 'prerelease': False, 'assets': [], 'upload_url': 'https://uploads.example/assets{?name}'}
         publish(self.root / 'dist', 'example/test', '', gh)
         self.assertFalse(gh.release['draft'])
+    def test_draft_asset_conflict_is_checked_before_any_missing_upload(self):
+        self.package(); gh = FakeGitHub()
+        name = 'v8-15.4.80.24-windows-x64.tar.gz'
+        gh.release = {'id': 1, 'draft': True, 'tag_name': 'v8-15.4.80.24',
+            'target_commitish': 'd' * 40, 'prerelease': False,
+            'assets': [{'name': name}], 'upload_url': 'https://uploads.example/assets{?name}'}
+        gh.payloads[name] = b'conflict'
+        with self.assertRaisesRegex(ValueError, 'refusing overwrite'):
+            publish(self.root / 'dist', 'example/test', '', gh)
+        self.assertEqual([], gh.mutations)
     def test_published_incomplete_refuses_mutation(self):
         self.package(); gh = FakeGitHub()
         gh.release = {'draft': False, 'assets': [], 'tag_name': 'v8-15.4.80.24', 'target_commitish': 'd' * 40, 'prerelease': False}

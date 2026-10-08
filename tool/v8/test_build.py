@@ -65,6 +65,38 @@ class BuildContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError): builder.require_host('macos-x64')
                 with self.assertRaises(ValueError): builder.require_host('android-arm64')
 
+    def test_macos_sdk_leaves_host_malloc_and_full_v8_features_intact(self):
+        # Compare the complete emitted configuration: allocator isolation must
+        # not become a reduced V8 profile or leak into Android's linker shim.
+        common = {
+            'is_debug': False, 'is_component_build': False,
+            'v8_monolithic': True, 'v8_monolithic_for_shared_library': True,
+            'v8_use_external_startup_data': False, 'use_custom_libcxx': True,
+            'v8_enable_i18n_support': True, 'v8_enable_temporal_support': True,
+            'icu_use_data_file': False, 'use_remoteexec': False,
+            'symbol_level': 0, 'use_thin_lto': False,
+        }
+        for target in ('macos-arm64', 'macos-x64', 'android-arm64', 'android-x64'):
+            with self.subTest(target=target):
+                emitted = dict(line.split(' = ', 1) for line in
+                               builder.gn_arguments(target).splitlines())
+                actual = {key: json.loads(value) for key, value in emitted.items()}
+                cpu = 'arm64' if target.endswith('arm64') else 'x64'
+                expected = common | {'target_cpu': cpu, 'v8_target_cpu': cpu}
+                if target.startswith('macos-'):
+                    expected |= {'target_os': 'mac', 'mac_deployment_target': '13.0',
+                                 'use_lld': False, 'use_allocator_shim': False,
+                                 'use_partition_alloc_as_malloc': False}
+                else:
+                    expected |= {'target_os': 'android', 'android_ndk_api_level': 26}
+                self.assertEqual(actual, expected)
+                # Do not disable V8's own allocator or override upstream
+                # JIT/Wasm/sandbox/GC defaults to solve host malloc ownership.
+                for option in ('use_partition_alloc', 'enable_backup_ref_ptr_support',
+                               'v8_enable_jit', 'v8_enable_webassembly',
+                               'v8_enable_sandbox', 'v8_enable_pointer_compression'):
+                    self.assertNotIn(option, actual)
+
     def test_native_archive_inspection_rejects_bitcode_and_wrong_cpu(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'sdk.a'

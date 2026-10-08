@@ -11,6 +11,7 @@ import sys
 import urllib.error
 import urllib.request
 import urllib.parse
+from release_pins import release_tag, release_metadata
 
 V8_REPOSITORY = 'https://chromium.googlesource.com/v8/v8.git'
 STABLE_URL = 'https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Linux&num=1'
@@ -101,14 +102,18 @@ def header_version(encoded, branch):
     return '.'.join(str(value) for value in values[:4 if values[3] else 3])
 
 
-def release_decision(release, manifest, version, revision):
+def release_decision(release, manifest, version, revision, sdkArtifactRevision=0):
+    tag = release_tag(version, sdkArtifactRevision)
     if release is None:
         return True, 'new'
     if release.get('prerelease'):
         raise ValueError('stable tag already belongs to a prerelease')
-    if release.get('tag_name') != f'v8-{version}':
+    if release.get('tag_name') != tag:
         raise ValueError('GitHub release tag differs')
     if manifest is not None:
+        release_metadata(manifest, version)
+        if manifest.get('sdkArtifactRevision', 0) != sdkArtifactRevision:
+            raise ValueError('existing tag SDK artifact revision differs')
         v8 = manifest.get('v8', {})
         if (manifest.get('schemaVersion') != 1 or v8.get('version') != version
                 or v8.get('revision') != revision or v8.get('repository') != V8_REPOSITORY):
@@ -160,7 +165,10 @@ def published_release(repository, tag, token):
     return release, manifest
 
 
-def detect(repository, token=None):
+def detect(repository, token=None, sdkArtifactRevision=0):
+    # Only an explicit caller may select an SDK revision; scheduled Stable
+    # detection always defaults to the original upstream-version release.
+    release_tag('0.0.0', sdkArtifactRevision)
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
         raise ValueError('repository must be owner/repo')
     stable = stable_release(read_json(STABLE_URL))
@@ -173,13 +181,17 @@ def detect(repository, token=None):
     current = stable_release(read_json(STABLE_URL))
     if current['milestone'] != stable['milestone']:
         raise ValueError('Stable milestone changed during detection; retry')
-    tag = f'v8-{version}'
+    tag = release_tag(version, sdkArtifactRevision)
     release, manifest = published_release(repository, tag, token)
-    should_build, status = release_decision(release, manifest, version, revision)
-    return {'schemaVersion': 1, 'version': version, 'revision': revision,
+    should_build, status = release_decision(release, manifest, version, revision, sdkArtifactRevision)
+    result = {'schemaVersion': 1, 'version': version, 'revision': revision,
             'repository': V8_REPOSITORY, 'branch': f'refs/branch-heads/{branch}',
             'chrome_version': current['version'], 'milestone': stable['milestone'],
             'tag': tag, 'should_build': should_build, 'status': status}
+    if sdkArtifactRevision:
+        result.update(sdkArtifactRevision=sdkArtifactRevision, releaseTag=tag,
+                      replacesTargets=['macos-arm64', 'macos-x64'])
+    return result
 
 
 def main(argv=None):
@@ -187,9 +199,11 @@ def main(argv=None):
     parser.add_argument('--repository', required=True, help='GitHub release repository owner/repo')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--github-output', type=Path)
+    parser.add_argument('--sdk-artifact-revision', type=int, default=0)
     args = parser.parse_args(argv)
     try:
-        result = detect(args.repository, os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN'))
+        result = detect(args.repository, os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN'),
+                        args.sdk_artifact_revision)
         payload = json.dumps(result, indent=2, sort_keys=True) + '\n'
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

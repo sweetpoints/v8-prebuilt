@@ -1,0 +1,95 @@
+name: macOS SDK allocator validation
+on:
+  pull_request:
+    paths:
+      - tool/v8/build.py
+      - tool/v8/test_build.py
+      - .github/workflows/macos-allocator-validation.yml
+permissions:
+  contents: read
+concurrency:
+  group: macos-sdk-allocator-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+jobs:
+  macos-sdk:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-26
+            python_arch: arm64
+            jobs: 2
+          - target: macos-x64
+            runner: macos-26-intel
+            python_arch: x64
+            jobs: 4
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEPOT_TOOLS_UPDATE: '0'
+      PYTHONUNBUFFERED: '1'
+      V8_VERSION: '15.4.80.25'
+      V8_REVISION: c45871fec706a6e7b715e607065bb4578b23ce9f
+      SDK_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.python_arch }}
+      - name: Freeze the affected SDK source
+        run: |
+          python - <<'PYTHON'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'tool')
+          from release_pins import make_pins
+          base = json.loads(Path('tool/v8/pins.json').read_text())
+          version = os.environ['V8_VERSION']
+          pins = make_pins(base, {'version': version,
+              'revision': os.environ['V8_REVISION'], 'tag': 'v8-' + version})
+          Path('candidate-pins.json').write_text(json.dumps(pins, indent=2) + '\n')
+          PYTHON
+      - name: Build only the affected macOS SDK
+        run: python tool/v8/build.py build --target "$SDK_TARGET" --pins-file candidate-pins.json --cache-root .cache/v8-source --jobs '${{ matrix.jobs }}'
+      - name: Verify SDK does not replace the host malloc zone
+        run: |
+          python - <<'PYTHON'
+          import json, os, subprocess
+          from pathlib import Path
+          root = Path('artifacts') / os.environ['V8_REVISION'] / os.environ['SDK_TARGET']
+          gn = root.joinpath('args.gn').read_text()
+          for name in ('use_allocator_shim', 'use_partition_alloc_as_malloc'):
+              if name + '=false' not in gn.replace(' ', ''):
+                  raise ValueError('SDK must retain the host allocator: ' + name)
+          archives = list(root.rglob('*v8_monolith*.a'))
+          if len(archives) != 1:
+              raise ValueError('One V8 monolith archive required')
+          symbols = subprocess.run(['nm', '-a', str(archives[0])],
+              check=True, capture_output=True, text=True).stdout
+          forbidden = ['InitializeDefaultMallocZoneWithPartitionAlloc',
+              'TryFreeDefaultFallbackToFindZoneAndFree']
+          if any(name in symbols for name in forbidden):
+              raise ValueError('Process-wide malloc zone shim remains in the SDK')
+          root.joinpath('allocator-isolation.json').write_text(json.dumps({
+              'status': 'passed', 'target': os.environ['SDK_TARGET'],
+              'v8Revision': os.environ['V8_REVISION'], 'forbiddenSymbols': forbidden,
+              'processMallocReplaced': False}, indent=2) + '\n')
+          PYTHON
+      - name: Compile and execute the official full-feature SDK consumer
+        run: python tool/sdk_smoke.py --sdk-root "artifacts/$V8_REVISION/$SDK_TARGET" --expected-version "$V8_VERSION" --output "artifacts/$V8_REVISION/$SDK_TARGET/sdk-smoke.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          archive: true
+          name: candidate-${{ matrix.target }}
+          path: |
+            artifacts/
+            candidate-pins.json
+          if-no-files-found: error
+          retention-days: 14
