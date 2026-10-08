@@ -10,6 +10,7 @@ import re
 import struct
 import tarfile
 from sdk_smoke import PROBE
+from release_pins import release_metadata
 
 TARGETS = ('android-arm64', 'android-x64', 'ios-arm64', 'ios-simulator-arm64',
            'macos-arm64', 'macos-x64', 'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64')
@@ -42,8 +43,12 @@ def verify_windows_arm_probe(path):
     if struct.unpack_from('<H', data, offset + 4)[0] != 0xaa64:
         raise ValueError('Windows ARM64 consumer must execute an ARM64 PE, not an emulated x64 PE')
 
-def verify_feature_profile(root, target):
+def verify_feature_profile(root, target, sdk_artifact_revision=0):
     linking = json.loads(contained(root, target + '/linking.json').read_text())
+    args = contained(root, target + '/args.gn').read_text()
+    verify_feature_profile_data(linking, args, target, sdk_artifact_revision)
+
+def verify_feature_profile_data(linking, args, target, sdk_artifact_revision=0):
     ios = target.startswith('ios-')
     expected = {'internationalization': True, 'temporal': True, 'icuData': 'embedded',
                 'jit': False if ios else 'upstream-default',
@@ -52,15 +57,27 @@ def verify_feature_profile(root, target):
     profile = linking.get('featureProfile')
     if (profile != expected or any(type(profile[key]) is not type(value) for key, value in expected.items())):
         raise ValueError('full SDK feature profile required')
-    args = contained(root, target + '/args.gn').read_text()
     flags = {'v8_enable_i18n_support': True, 'v8_enable_temporal_support': True,
              'icu_use_data_file': False}
     if ios:
         flags.update(v8_jitless=True, v8_enable_webassembly=False)
+    if sdk_artifact_revision and target.startswith('macos-'):
+        flags.update(use_allocator_shim=False, use_partition_alloc_as_malloc=False)
     for flag, value in flags.items():
         assignments = re.findall(r'^\s*' + re.escape(flag) + r'\s*=\s*(.*?)\s*$', args, re.MULTILINE)
         if assignments != ['true' if value else 'false']:
             raise ValueError('full SDK GN feature configuration required')
+    if sdk_artifact_revision and target.startswith('macos-'):
+        # A manifest claiming upstream defaults cannot hide a reduced Mac
+        # build behind the two allocator isolation flags. Omitted flags retain
+        # upstream defaults; explicit assignments must preserve that profile.
+        defaults = {'v8_jitless': False, 'v8_enable_webassembly': True,
+                    'v8_enable_sandbox': True, 'v8_enable_pointer_compression': True,
+                    'use_partition_alloc': True}
+        for flag, value in defaults.items():
+            assignments = re.findall(r'^\s*' + re.escape(flag) + r'\s*=\s*(.*?)\s*$', args, re.MULTILINE)
+            if assignments and assignments != ['true' if value else 'false']:
+                raise ValueError('full SDK GN feature configuration required')
 
 def verify_library_grouping(target, linking, command):
     grouping = linking.get('staticLibraryGrouping', 'normal')
@@ -164,6 +181,8 @@ def package(inputs, pins_path, output, builder_revision, reuse_plan=None):
     if not re.fullmatch(r'[0-9a-f]{40}', builder_revision):
         raise ValueError('builder revision must be full Git SHA')
     pins = json.loads(pins_path.read_text())
+    metadata = release_metadata(reuse_plan or {}, pins['v8']['version'])
+    sdk_revision = metadata.get('sdkArtifactRevision', 0)
     if reuse_plan is not None:
         from release_resume import validate_generic_plan
         validate_generic_plan(reuse_plan, pins, builder_revision)
@@ -257,7 +276,7 @@ def package(inputs, pins_path, output, builder_revision, reuse_plan=None):
                 verify(manifest_path.parent, {'path': entry['header'], 'sha256': entry['headerSha256']})
             for item in entry.get('platformBuildInputs', []):
                 verify(manifest_path.parent, item)
-            verify_feature_profile(manifest_path.parent, target)
+            verify_feature_profile(manifest_path.parent, target, sdk_revision)
             linking = json.loads(contained(manifest_path.parent, target + '/linking.json').read_text())
             if target.startswith('android-'):
                 if entry['linkSmoke'].get('linkingSha256') != digest(contained(manifest_path.parent, target + '/linking.json')):
@@ -327,6 +346,7 @@ def package(inputs, pins_path, output, builder_revision, reuse_plan=None):
     output.mkdir(parents=True, exist_ok=False)
     assets = []
     release = dict(provenance, builderRevision=builder_revision, packagingRevision=builder_revision, targets={}, licenses={})
+    release.update(metadata)
     pins_bytes = (json.dumps(pins, indent=2, sort_keys=True) + '\n').encode()
     for target in TARGETS:
         root, manifest, entry, expected_files, proof_reports = found[target]
@@ -369,7 +389,7 @@ def package(inputs, pins_path, output, builder_revision, reuse_plan=None):
                 raise ValueError('SDK consumer executable changed during packaging')
         entry['files'] = [{'path': name, 'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)} for name, data in sorted(entries.items()) if name.startswith(target + '/')]
         entry['targetFiles'] = entry['files']
-        single = dict(provenance, targets={target: entry}, licenses=manifest['licenses'])
+        single = dict(provenance, targets={target: entry}, licenses=manifest['licenses'], **metadata)
         entries['manifest.json'] = (json.dumps(single, indent=2, sort_keys=True) + '\n').encode()
         if target + '/include/v8.h' not in entries or target + '/linking.json' not in entries:
             raise ValueError('consumer V8 headers and linking contract required')

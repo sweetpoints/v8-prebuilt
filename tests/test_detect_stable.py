@@ -6,6 +6,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import urllib.error
+import sys
+
+sys.path.insert(0, str(Path(__file__).parents[1] / 'tool'))
 
 spec = importlib.util.spec_from_file_location('detect_stable', Path(__file__).parents[1] / 'tool/detect_stable.py')
 d = importlib.util.module_from_spec(spec)
@@ -104,6 +107,28 @@ class StableDetectorTest(unittest.TestCase):
         for draft in (False, True):
             with self.assertRaises(ValueError):
                 d.release_decision(release(draft), value, VERSION, REV)
+
+    def test_sdk_revision_uses_distinct_tag_and_default_schedule_stays_zero(self):
+        r, m = release(), manifest()
+        tag = d.release_tag(VERSION, 1)
+        r['tag_name'] = tag
+        m.update(sdkArtifactRevision=1, releaseTag=tag,
+                 replacesTargets=['macos-arm64', 'macos-x64'])
+        self.assertEqual(d.release_decision(r, m, VERSION, REV, 1), (False, 'published'))
+        with self.assertRaises(ValueError):
+            d.release_decision(r, m, VERSION, REV)
+        for revision in (-1, True, '1'):
+            with patch.object(d, 'read_json') as network, self.assertRaises(ValueError):
+                d.detect('owner/repo', sdkArtifactRevision=revision)
+            network.assert_not_called()
+        rows = [stable(), [{'milestone': 154, 'v8_branch': '15.4'}], stable()]
+        with patch.object(d, 'read_json', side_effect=rows), patch.object(d, 'branch_revision', return_value=REV), \
+                patch.object(d, 'fetch', return_value=header()), \
+                patch.object(d, 'published_release', return_value=(None, None)) as lookup:
+            result = d.detect('owner/repo')
+        self.assertEqual(result['tag'], 'v8-' + VERSION)
+        self.assertNotIn('sdkArtifactRevision', result)
+        self.assertEqual(lookup.call_args.args[1], 'v8-' + VERSION)
 
     def test_old_bridge_or_non_sdk_release_rejected_even_draft(self):
         bridged = manifest()
