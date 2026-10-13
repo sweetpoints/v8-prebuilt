@@ -5,6 +5,9 @@ on:
       - tool/v8/build.py
       - tool/v8/test_build.py
       - .github/workflows/macos-allocator-validation.yml
+      - tool/sdk_smoke.py
+      - tests/test_sdk_smoke.py
+      - tests/test_macos_allocator_workflow.py
 permissions:
   contents: read
 concurrency:
@@ -58,6 +61,42 @@ jobs:
           PYTHON
       - name: Build only the affected macOS SDK
         run: python tool/v8/build.py build --target "$SDK_TARGET" --pins-file candidate-pins.json --cache-root .cache/v8-source --jobs '${{ matrix.jobs }}'
+      # Built candidates retain source pins and the manifest hash index.
+      # The manifest records build success, not consumer acceptance.
+      - name: Preserve the built candidate before validation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          archive: true
+          name: candidate-built-${{ matrix.target }}
+          path: |
+            artifacts/${{ env.V8_REVISION }}/
+            candidate-pins.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Select the fixed official consumer compiler
+        run: |
+          python - <<'PYTHON'
+          import json, os, pathlib, subprocess
+          revision, target = os.environ['V8_REVISION'], os.environ['SDK_TARGET']
+          source = pathlib.Path('.cache/v8-source') / revision / target / 'v8'
+          actual = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+          if actual != revision or not (source / 'include/v8-version.h').is_file():
+              raise ValueError('Fixed official macOS source identity differs')
+          compiler = source / 'third_party/llvm-build/Release+Asserts/bin/clang++'
+          if not compiler.is_file():
+              raise ValueError('Fixed official Clang consumer compiler missing')
+          version = subprocess.check_output([str(compiler), '--version'], text=True).strip()
+          root = pathlib.Path('artifacts') / revision
+          manifest = json.loads(root.joinpath('manifest.json').read_text())
+          if version != manifest['targets'][target]['toolchain']['clang']:
+              raise ValueError('Consumer compiler differs from the packaged SDK toolchain')
+          sysroot = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip()
+          if not pathlib.Path(sysroot).is_dir():
+              raise ValueError('Official macOS SDK sysroot missing')
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('V8_SDK_COMPILER=' + str(compiler.resolve()) + '\n')
+              stream.write('V8_SDK_SYSROOT=' + sysroot + '\n')
+          PYTHON
       - name: Verify SDK does not replace the host malloc zone
         run: |
           python - <<'PYTHON'
@@ -83,13 +122,16 @@ jobs:
               'processMallocReplaced': False}, indent=2) + '\n')
           PYTHON
       - name: Compile and execute the official full-feature SDK consumer
-        run: python tool/sdk_smoke.py --sdk-root "artifacts/$V8_REVISION/$SDK_TARGET" --expected-version "$V8_VERSION" --output "artifacts/$V8_REVISION/$SDK_TARGET/sdk-smoke.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        run: python tool/sdk_smoke.py --sdk-root "artifacts/$V8_REVISION/$SDK_TARGET" --expected-version "$V8_VERSION" --compiler "$V8_SDK_COMPILER" --sysroot "$V8_SDK_SYSROOT" --output "artifacts/$V8_REVISION/$SDK_TARGET/sdk-smoke.json"
+      - name: Preserve validation proof and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           archive: true
-          name: candidate-${{ matrix.target }}
+          name: candidate-proof-${{ matrix.target }}
           path: |
-            artifacts/
-            candidate-pins.json
-          if-no-files-found: error
+            artifacts/${{ env.V8_REVISION }}/${{ matrix.target }}/allocator-isolation.json
+            artifacts/${{ env.V8_REVISION }}/${{ matrix.target }}/sdk-smoke.json
+            artifacts/${{ env.V8_REVISION }}/${{ matrix.target }}/validation/
+          if-no-files-found: warn
           retention-days: 14
