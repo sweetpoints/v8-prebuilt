@@ -37,6 +37,40 @@ class ConsumerDiagnosticsTests(unittest.TestCase):
                     raised = error
             return json.loads(output.read_text()), raised, stderr.getvalue()
 
+    def test_cli_refuses_implicit_host_compiler_before_reading_sdk(self):
+        arguments = ['sdk_smoke.py', '--sdk-root', 'unused', '--expected-version',
+                     '15.4.80.25', '--output', 'unused.json']
+        with patch.object(smoke.sys, 'argv', arguments), patch.object(smoke, 'inputs') as inputs, \
+             contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as error:
+                smoke.main()
+        self.assertEqual(error.exception.code, 2)
+        inputs.assert_not_called()
+        self.assertIn('compilation requires --compiler', stderr.getvalue())
+
+    def test_native_smoke_rejects_package_hash_changes_before_success_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / 'sdk-smoke.json'
+            contract = {'runtimeFlags': []}
+            identity = {'linkingSha256': 'original-contract', 'librarySha256': 'original-library',
+                        'libraries': {'lib/monolith.a': 'original-library'}}
+            changed = {**identity, 'librarySha256': 'changed-library'}
+            def compile_probe(root, contract, compiler, probe, source, sysroot):
+                probe.write_bytes(b'probe')
+                return {'compiler': 'fixed official Clang', 'compileCommand': ['fixed-command']}
+            arguments = ['sdk_smoke.py', '--sdk-root', str(root), '--expected-version',
+                         '15.4.80.25', '--compiler', str(root / 'clang++'), '--output', str(output)]
+            success = subprocess.CompletedProcess('probe', 0,
+                stdout='official-v8-api-sdk-consumer-passed\n', stderr='')
+            with patch.object(smoke.sys, 'argv', arguments), \
+                 patch.object(smoke, 'inputs', side_effect=[(contract, identity), (contract, changed)]), \
+                 patch.object(smoke, 'compile_probe', side_effect=compile_probe), \
+                 patch.object(smoke.subprocess, 'run', return_value=success):
+                with self.assertRaisesRegex(ValueError, 'SDK inputs changed'):
+                    smoke.main()
+            self.assertFalse(output.exists())
+
     def test_access_violation_records_the_last_stage_and_still_raises(self):
         failure = subprocess.CalledProcessError(0xC0000005, 'sdk-probe.exe',
                                                 output='', stderr='sdk-stage: isolate-create\n')
